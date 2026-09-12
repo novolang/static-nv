@@ -1,0 +1,168 @@
+// staticenc_tests.nv — the three `Accept-Encoding` rules
+// implementations skip, and the `Vary` header whose absence poisons a
+// cache.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: static-nv.staticenc.<fn>`.
+
+use std.test
+use std.list
+use staticenc
+
+fn both() -> staticenc.StaticEncodings
+    staticenc.available(true, true, false)
+
+fn gzip_only() -> staticenc.StaticEncodings
+    staticenc.available(false, true, false)
+
+fn name_of(e: staticenc.StaticEncodings, header: Str) -> Str
+    match staticenc.choose(header, e)
+        Some(c) => staticenc.coding_name(c)
+        None    => "406"
+
+@test
+fn test_an_absent_header_means_serve_the_plain_file() [io]
+    // § 12.5.3: a request without the field accepts any encoding, and
+    // identity is the safe reading of "any".
+    test.case("empty")
+    test.assert_eq_str(name_of(both(), ""), "")
+
+@test
+fn test_the_preference_decides_when_a_client_accepts_several() [io]
+    test.case("brotli first, by default")
+    test.assert_eq_str(name_of(both(), "gzip, br"), "br")
+
+    test.case("gzip where that is all there is")
+    test.assert_eq_str(name_of(gzip_only(), "gzip, br"), "gzip")
+
+    test.case("and a deployment can reverse it")
+    let e = staticenc.with_preference(both(),
+                                      [staticenc.StaticGzip, staticenc.StaticBrotli])
+    test.assert_eq_str(name_of(e, "gzip, br"), "gzip")
+
+@test
+fn test_q_zero_is_a_refusal_and_not_a_low_score() [io]
+    // `gzip;q=0` means "do not send me gzip".  A server that reads it
+    // as a low preference sends gzip whenever nothing else is
+    // available — to a client that asked it not to.
+    test.case("refused outright")
+    test.assert(staticenc.is_refused("gzip;q=0, br", "gzip"))
+    test.assert(not staticenc.is_refused("gzip;q=0.1, br", "gzip"))
+
+    test.case("so it is not chosen even where it is the only sibling")
+    test.assert_eq_str(name_of(gzip_only(), "gzip;q=0"), "")
+
+    test.case("and a low weight is still a choice")
+    test.assert(staticenc.quality_of("gzip;q=0.5", "gzip") == 500)
+    test.assert(staticenc.quality_of("gzip", "gzip") == 1000)
+    test.assert(staticenc.quality_of("gzip;q=0", "gzip") == 0)
+
+@test
+fn test_a_coding_that_is_not_mentioned_is_not_the_same_as_one_refused() [io]
+    // The two mean opposite things for identity, so the answers have
+    // to be distinguishable.
+    test.case("not mentioned at all")
+    test.assert(staticenc.quality_of("gzip", "br") == 0 - 1)
+
+    test.case("covered by a star")
+    test.assert(staticenc.quality_of("gzip, *;q=0.5", "br") == 500)
+
+    test.case("and refused by a star")
+    test.assert(staticenc.quality_of("gzip, *;q=0", "br") == 0)
+
+@test
+fn test_gzip_alone_does_not_forbid_the_plain_file() [io]
+    // § 12.5.3 makes identity acceptable unless explicitly refused.  A
+    // server that read "gzip" as "gzip only" would 406 a client that
+    // would have been perfectly happy.
+    test.case("identity is still on the table")
+    test.assert(not staticenc.identity_refused("gzip"))
+    test.assert(not staticenc.identity_refused("gzip, deflate"))
+
+    test.case("so a root with no siblings still answers")
+    test.assert_eq_str(name_of(staticenc.none_available(), "gzip"), "")
+
+    test.case("and only an explicit refusal forbids it")
+    test.assert(staticenc.identity_refused("identity;q=0"))
+    test.assert(staticenc.identity_refused("*;q=0"))
+
+@test
+fn test_a_client_that_refused_everything_gets_a_406() [io]
+    // Rare, and a real answer: sending the plain file anyway would be
+    // sending bytes the client said it would not take.
+    test.case("the star with q=0 and nothing excepted")
+    test.assert_eq_str(name_of(both(), "*;q=0"), "406")
+
+    test.case("and the status is published")
+    test.assert(staticenc.not_acceptable_status() == 406)
+
+    test.case("a star with q=0 and an exception is not a refusal")
+    test.assert_eq_str(name_of(both(), "*;q=0, gzip"), "gzip")
+
+@test
+fn test_a_coding_names_its_header_value_and_its_suffix() [io]
+    test.case("the Content-Encoding token")
+    test.assert_eq_str(staticenc.coding_name(staticenc.StaticGzip), "gzip")
+    test.assert_eq_str(staticenc.coding_name(staticenc.StaticBrotli), "br")
+    test.assert_eq_str(staticenc.coding_name(staticenc.StaticZstd), "zstd")
+
+    test.case("identity carries NO header at all, rather than the word")
+    test.assert_eq_str(staticenc.coding_name(staticenc.StaticIdentity), "")
+
+    test.case("and the filename suffix")
+    test.assert_eq_str(staticenc.coding_suffix(staticenc.StaticGzip), ".gz")
+    test.assert_eq_str(staticenc.coding_suffix(staticenc.StaticBrotli), ".br")
+    test.assert_eq_str(staticenc.coding_suffix(staticenc.StaticIdentity), "")
+
+@test
+fn test_a_sibling_keeps_the_originals_extension_and_therefore_its_media_type() [io]
+    // The media type of a gzip-encoded stylesheet is still
+    // `text/css`.  A server that answered `application/gzip` would
+    // hand a browser a file it downloads instead of applying.
+    test.case("the suffix goes on the END")
+    test.assert_eq_str(staticenc.sibling_path("css/site.css", staticenc.StaticGzip),
+                       "css/site.css.gz")
+    test.assert_eq_str(staticenc.sibling_path("css/site.css", staticenc.StaticBrotli),
+                       "css/site.css.br")
+
+    test.case("identity is the path unchanged")
+    test.assert_eq_str(staticenc.sibling_path("css/site.css", staticenc.StaticIdentity),
+                       "css/site.css")
+
+    test.case("and the inverse reads it back")
+    test.assert(staticenc.coding_of_path("css/site.css.br") == staticenc.StaticBrotli)
+    test.assert(staticenc.coding_of_path("css/site.css") == staticenc.StaticIdentity)
+
+@test
+fn test_vary_is_emitted_on_every_response_and_its_absence_is_a_poisoning() [io]
+    // A shared cache that stored a gzip response without it serves
+    // those bytes to a client that cannot decode them — a stylesheet
+    // rendering as binary for everybody behind that cache until it
+    // expires.
+    test.case("the header")
+    test.assert_eq_str(staticenc.vary_header(), "Accept-Encoding")
+
+@test
+fn test_this_package_does_not_compress_and_says_which_packages_do() [io]
+    // A build compresses once per deploy; a server that gzips per
+    // request compresses once per requester.
+    test.case("the producing packages are named rather than depended on")
+    test.assert(list.len(staticenc.producing_packages()) == 3)
+
+@test
+fn test_something_already_compressed_is_not_worth_a_sibling() [io]
+    // A `.gz` beside a PNG is larger than the PNG, and the round trip
+    // through a decoder is spent for nothing.  The BUILD needs the
+    // same rule, which is why it is published.
+    test.case("images, video and archives are not")
+    test.assert(not staticenc.worth_compressing("image/png"))
+    test.assert(not staticenc.worth_compressing("image/jpeg"))
+    test.assert(not staticenc.worth_compressing("video/mp4"))
+    test.assert(not staticenc.worth_compressing("application/zip"))
+    test.assert(not staticenc.worth_compressing("font/woff2"))
+
+    test.case("text and the text-shaped application types are")
+    test.assert(staticenc.worth_compressing("text/css"))
+    test.assert(staticenc.worth_compressing("text/html"))
+    test.assert(staticenc.worth_compressing("application/json"))
+    test.assert(staticenc.worth_compressing("image/svg+xml"))

@@ -1,0 +1,355 @@
+// staticrange.nv — `Range`, and the four ways answering one goes
+// wrong.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A RANGE REQUEST IS HOW A VIDEO SCRUBS AND HOW A DOWNLOAD RESUMES,
+// and it is the one part of a static file server where a client
+// controls arithmetic the server performs.  Four things go wrong, and
+// the signatures below are shaped around them:
+//
+// 1. AN UNSATISFIABLE RANGE IS A 416, NOT A 404.  RFC 9110 § 14.4 says
+//    so, and the 416 carries a `Content-Range: bytes * /<size>` header
+//    telling the client how big the file actually is — which is what
+//    lets a resumed download that lost track correct itself instead of
+//    failing.  `unsatisfiable_header` builds it.
+//
+// 2. A MULTI-RANGE REQUEST IS AN AMPLIFIER.  `Range: bytes=0-0,1-1,2-2,…`
+//    with ten thousand ranges produces a multipart response whose
+//    boundaries and part headers are many times the size of the file.
+//    RFC 9110 § 14.2 permits a server to refuse, and `StaticRangeLimits`
+//    is where the ceiling lives — a number, checked at parse, rather
+//    than a paragraph.
+//
+// 3. OVERLAPPING RANGES ARE THE SAME AMPLIFIER WITH BETTER MANNERS.
+//    `bytes=0-1000000,0-1000000,0-1000000` is three ranges and three
+//    megabytes from a one-megabyte file.  `total_bytes` is what a
+//    caller checks against `StaticRangeLimits.max_total`.
+//
+// 4. A SUFFIX RANGE IS THE ONE WITH THE ARITHMETIC.  `bytes=-500` is
+//    the LAST five hundred bytes, not "from 500 to the end", and
+//    `bytes=-0` is unsatisfiable rather than empty.  Both are one line
+//    in the specification and both are wrong in implementations.
+//
+// NOTHING HERE PERFORMS ANYTHING.  A `Range` header is a string and a
+// size is an integer; every one of the cases above is a test with a
+// literal in it.
+//
+// WHY THE PARSER IS HERE.  `Range`, `Content-Range` and the multipart
+// framing have no parser on the grid: http-codec-nv reads a
+// request line, the headers as name-value pairs, and the body's
+// framing, and stops there.  A second consumer — a caching proxy, a
+// client that resumes its own downloads — would be the reason to move
+// these four into a shared package, and the README names that.
+
+use staticerr
+
+// One byte range, resolved against a known size.
+//
+// Resolved, not as written: `bytes=-500` and `bytes=9500-` against a
+// 10000-byte file are the same range, and a caller that had to
+// re-derive that would derive it differently in two places.
+pub struct StaticRange
+    // The first byte, inclusive.
+    first: Int
+    // The last byte, INCLUSIVE — which is HTTP's convention and not a
+    // programming language's.  A range of `0-0` is one byte.  The
+    // field is named `last` rather than `end` so nobody reads it as
+    // exclusive.
+    last: Int
+
+// What a deployment will answer.
+pub struct StaticRangeLimits
+    // The most ranges in one request.  Four by default: a video player
+    // sends one, a parallel downloader a handful, and a request with
+    // forty is not a client anybody has.
+    max_ranges: Int
+    // The most bytes the ranges may total, as a multiple of the file's
+    // size, times one hundred.  150 means "one and a half files";
+    // above it the request is refused.  A multiple rather than an
+    // absolute number, because the thing being bounded is
+    // amplification.
+    max_total_percent: Int
+
+// The conventional limits: four ranges, one and a half files.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println("${staticrange.default_limits().max_ranges}")
+// ```
+pub fn default_limits() -> StaticRangeLimits []
+    todo("static-nv.staticrange.default_limits")
+
+// Limits a caller chose.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println("${staticrange.limits(1, 100).max_ranges}")
+// ```
+pub fn limits(max_ranges: Int, max_total_percent: Int) -> StaticRangeLimits []
+    todo("static-nv.staticrange.limits")
+
+// A `Range` header, resolved against a size.
+//
+// Answers the ranges in the order the header listed them — NOT sorted
+// and NOT coalesced, because RFC 9110 § 14.2 lets a server do either
+// and a client that asked for two ranges expects two parts.
+//
+// `Ok([])` for a header this package does not recognise as a range
+// request at all: § 14.2 says a recipient that does not understand a
+// range unit MUST ignore the header, and answering the whole file with
+// a 200 is what "ignore" means.  A request whose unit is `bytes` and
+// whose ranges are all outside the file is a 416, which is
+// `StaticRangeUnsatisfiable` rather than an empty list — the two look
+// alike and answer differently.
+//
+// ```novo
+// use std.list
+// use staticrange
+//
+// fn main() [io]
+//     match staticrange.parse("bytes=0-499", 10000, staticrange.default_limits())
+//         Ok(rs) => println("${list.len(rs)}")
+//         Err(_) => println("refused")
+// ```
+pub fn parse(header: Str, size: Int,
+             lim: StaticRangeLimits) -> Result<[StaticRange], staticerr.StaticFault> []
+    todo("static-nv.staticrange.parse")
+
+// Whether a header is a range request this package will look at.
+//
+// `bytes=` and nothing else.  A header naming another unit is ignored,
+// which is a 200 with the whole file — § 14.2's own rule and not a
+// refusal.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println("${staticrange.is_byte_range("bytes=0-99")}")
+// ```
+pub fn is_byte_range(header: Str) -> Bool []
+    todo("static-nv.staticrange.is_byte_range")
+
+// How many bytes a set of ranges totals.
+//
+// What the amplification ceiling is checked against, and what a
+// caller sizes a buffer with.  Counts overlaps twice, deliberately:
+// overlapping ranges ARE sent twice, so a total that de-duplicated
+// them would under-report exactly the request that is a problem.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     match staticrange.parse("bytes=0-499,0-499", 10000, staticrange.default_limits())
+//         Err(_) => println("refused")
+//         Ok(rs) => println("${staticrange.total_bytes(rs)}")
+// ```
+pub fn total_bytes(rs: [StaticRange]) -> Int []
+    todo("static-nv.staticrange.total_bytes")
+
+// The length of one range, in bytes.
+//
+// `last - first + 1`, because `last` is inclusive — which is the
+// arithmetic an off-by-one lives in, so it is a function rather than
+// something every caller writes.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println("${staticrange.range_len(StaticRange { first: 0, last: 0 })}")
+// ```
+pub fn range_len(r: StaticRange) -> Int []
+    todo("static-nv.staticrange.range_len")
+
+// The `Content-Range` header for a single-range 206.
+//
+// `bytes 0-499/10000` — first, last, and the WHOLE file's size, which
+// is the number a client uses to know how much is left.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println(staticrange.content_range(StaticRange { first: 0, last: 499 }, 10000))
+// ```
+pub fn content_range(r: StaticRange, size: Int) -> Str []
+    todo("static-nv.staticrange.content_range")
+
+// The `Content-Range` header for a 416: `bytes * /10000`.
+//
+// RFC 9110 § 14.4 requires it, and it is the useful half of the
+// answer: a resumed download whose idea of the file's length is wrong
+// corrects itself from this header instead of failing.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println(staticrange.unsatisfiable_header(10000))
+// ```
+pub fn unsatisfiable_header(size: Int) -> Str []
+    todo("static-nv.staticrange.unsatisfiable_header")
+
+// The `Accept-Ranges: bytes` header, which says range requests work.
+//
+// Emitted on every response, including the 200s: a client deciding
+// whether it CAN resume a download reads this from the first response,
+// before it has any reason to send a `Range`.  A server that omits it
+// gets whole-file re-downloads from clients that would have resumed.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println(staticrange.accept_ranges())
+// ```
+pub fn accept_ranges() -> Str []
+    todo("static-nv.staticrange.accept_ranges")
+
+// ── Multipart ────────────────────────────────────────────────────────
+
+// The `Content-Type` for a multi-range 206, with a boundary.
+//
+// `multipart/byteranges; boundary=<b>`.  The boundary is the caller's
+// — it has to be unguessable enough not to appear in the content, and
+// minting one costs `[fs, rand]`, which this module is not going to
+// pay on every request.  `staticfs.serve` passes one.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println(staticrange.multipart_type("NOVOBOUNDARY1234"))
+// ```
+pub fn multipart_type(boundary: Str) -> Str []
+    todo("static-nv.staticrange.multipart_type")
+
+// The header block before one part of a multipart response.
+//
+// `--boundary`, a `Content-Type`, a `Content-Range`, and the blank
+// line.  Published as a function because the exact bytes — including
+// which newlines are CRLF — are what a client parses, and a caller
+// assembling them by hand assembles them slightly differently.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     let r = StaticRange { first: 0, last: 499 }
+//     println(staticrange.part_header("B", "text/plain", r, 10000))
+// ```
+pub fn part_header(boundary: Str, content_type: Str, r: StaticRange, size: Int) -> Str []
+    todo("static-nv.staticrange.part_header")
+
+// The closing delimiter of a multipart response: `--boundary--`.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println(staticrange.multipart_end("B"))
+// ```
+pub fn multipart_end(boundary: Str) -> Str []
+    todo("static-nv.staticrange.multipart_end")
+
+// How many bytes a multipart response will be, given the ranges and
+// the boundary.
+//
+// The number that goes in `Content-Length`, and the reason it is
+// published: a multipart body's length is the parts PLUS the
+// boundaries and part headers, and a server that sends the parts'
+// total gets a response the client truncates.  Computing it requires
+// knowing exactly what `part_header` emits, which is why they live
+// together.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     match staticrange.parse("bytes=0-9,20-29", 100, staticrange.default_limits())
+//         Err(_) => println("refused")
+//         Ok(rs) => println("${staticrange.multipart_len(rs, "B", "text/plain", 100)}")
+// ```
+pub fn multipart_len(rs: [StaticRange], boundary: Str, content_type: Str, size: Int) -> Int []
+    todo("static-nv.staticrange.multipart_len")
+
+// ── The three parse cases, individually ──────────────────────────────
+//
+// Published so the arithmetic each one carries is a test rather than a
+// paragraph.
+
+// A range written `first-last`, resolved against a size.
+//
+// `last` is clamped to the final byte — RFC 9110 § 14.1.1 says a
+// `last-byte-pos` past the end is the end, which is what lets a client
+// ask for `0-999999` and get the whole file.  `None` where `first` is
+// past the end, which is the unsatisfiable case.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     match staticrange.resolve_closed(0, 999999, 100)
+//         Some(r) => println("${r.last}")
+//         None    => println("unsatisfiable")
+// ```
+pub fn resolve_closed(first: Int, last: Int, size: Int) -> ?StaticRange []
+    todo("static-nv.staticrange.resolve_closed")
+
+// A range written `first-`, meaning "from here to the end".
+//
+// `None` where `first` is at or past the end.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     match staticrange.resolve_open(50, 100)
+//         Some(r) => println("${r.last}")
+//         None    => println("unsatisfiable")
+// ```
+pub fn resolve_open(first: Int, size: Int) -> ?StaticRange []
+    todo("static-nv.staticrange.resolve_open")
+
+// A range written `-n`, meaning THE LAST `n` BYTES.
+//
+// Not "from n to the end" — which is what `resolve_open` is, and which
+// is the reading that gets implemented by accident.  A suffix longer
+// than the file is the whole file; `-0` is UNSATISFIABLE rather than
+// an empty range, because § 14.1.1's grammar makes a zero-length
+// suffix meaningless and a server answering it with an empty 206 is
+// answering a question nobody asked.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     match staticrange.resolve_suffix(500, 10000)
+//         Some(r) => println("${r.first}")
+//         None    => println("unsatisfiable")
+// ```
+pub fn resolve_suffix(suffix_len: Int, size: Int) -> ?StaticRange []
+    todo("static-nv.staticrange.resolve_suffix")
+
+// Whether a zero-length file can answer any range at all.
+//
+// It cannot: every range against a zero-byte file is unsatisfiable,
+// including `-0` and `0-`.  Published because it is the boundary case
+// a parser written from the grammar gets wrong in both directions —
+// answering an empty 206, or dividing by the size.
+//
+// ```novo
+// use staticrange
+//
+// fn main() [io]
+//     println("${staticrange.any_satisfiable(0)}")
+// ```
+pub fn any_satisfiable(size: Int) -> Bool []
+    todo("static-nv.staticrange.any_satisfiable")

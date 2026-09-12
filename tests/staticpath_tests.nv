@@ -1,0 +1,351 @@
+// staticpath_tests.nv — the traversal rules, as a table.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: static-nv.staticpath.<fn>`.
+//
+// **THIS FILE IS THE SECURITY ARGUMENT.**  Path traversal is the oldest
+// vulnerability a file server has, and the way it survives is that the
+// rules get checked against a filesystem: a suite covers the ten
+// inputs somebody thought of, the eleventh is a CVE, and nobody can
+// read the rules without running them.
+//
+// `staticpath.resolve` is `[]`, so every input below is a string and
+// every answer is a value.  What follows is the complete rule set,
+// readable end to end, with the input that triggers each refusal
+// beside it.  A reviewer auditing this package reads this file.
+//
+// The `exists` predicate is a list of names, which is what makes the
+// whole thing run with no directory in the room.
+
+use std.test
+use std.list
+use std.str
+use staticerr
+use staticpath
+
+// A filesystem made of three names.  `staticfs.kind_of` is the real
+// one; this is the same shape.
+fn fake_fs(relative: Str) -> Int
+    if relative == "index.html" or relative == "css/site.css"
+        staticpath.kind_file()
+    else
+        if relative == "css" or relative == "" or relative == "docs"
+            staticpath.kind_directory()
+        else
+            staticpath.kind_missing()
+
+fn refused(target: Str) -> Bool
+    match staticpath.resolve(target, staticpath.defaults(), fake_fs)
+        StaticRefused(_)   => true
+        StaticFile(_)      => false
+        StaticIndex(_)     => false
+        StaticDirectory(_) => false
+        StaticRedirect(_)  => false
+
+@test
+fn test_an_ordinary_path_resolves() [io]
+    test.case("a file")
+    match staticpath.resolve("/css/site.css", staticpath.defaults(), fake_fs)
+        StaticFile(r)      => test.assert_eq_str(r, "css/site.css")
+        StaticIndex(_)     => test.assert(false)
+        StaticDirectory(_) => test.assert(false)
+        StaticRedirect(_)  => test.assert(false)
+        StaticRefused(_)   => test.assert(false)
+
+    test.case("a directory with an index")
+    match staticpath.resolve("/", staticpath.defaults(), fake_fs)
+        StaticIndex(r)     => test.assert_eq_str(r, "index.html")
+        StaticFile(_)      => test.assert(false)
+        StaticDirectory(_) => test.assert(false)
+        StaticRedirect(_)  => test.assert(false)
+        StaticRefused(_)   => test.assert(false)
+
+    test.case("a path that is simply not there is NOT a refusal")
+    match staticpath.resolve("/nothing.txt", staticpath.defaults(), fake_fs)
+        StaticRefused(_)   => test.assert(false)
+        StaticFile(_)      => test.assert(false)
+        StaticIndex(_)     => test.assert(false)
+        StaticDirectory(_) => test.assert(false)
+        StaticRedirect(_)  => test.assert(true)
+
+@test
+fn test_the_decode_happens_before_the_check_which_is_what_catches_encoded_dots() [io]
+    // `/files/%2e%2e/etc/passwd` has no `..` in it as it arrives.  A
+    // check run before the decode passes it, and the decode afterwards
+    // produces exactly the traversal the check was for.
+    test.case("a literal traversal")
+    test.assert(refused("/../etc/passwd"))
+    test.assert(refused("/css/../../etc/passwd"))
+
+    test.case("percent-encoded, lower case")
+    test.assert(refused("/%2e%2e/etc/passwd"))
+
+    test.case("percent-encoded, upper case")
+    test.assert(refused("/%2E%2E/etc/passwd"))
+
+    test.case("half-encoded")
+    test.assert(refused("/.%2e/etc/passwd"))
+    test.assert(refused("/%2e./etc/passwd"))
+
+    test.case("and a single dot, which is a segment that means `here`")
+    test.assert(refused("/./index.html"))
+
+@test
+fn test_the_split_happens_before_the_decode_which_is_what_catches_encoded_slashes() [io]
+    // `/files/a%2Fb` is ONE segment whose name contains a slash.  A
+    // resolver that decoded first would see two segments and hand back
+    // a path one directory deeper than the request named.
+    test.case("an encoded forward slash")
+    test.assert(refused("/css/a%2Fb"))
+    test.assert(refused("/css/a%2fb"))
+
+    test.case("an encoded backslash, which is a separator on some platforms")
+    test.assert(refused("/css/a%5Cb"))
+
+    test.case("and a literal backslash, for the same reason")
+    test.assert(refused("/css/a\\b"))
+
+@test
+fn test_a_nul_byte_is_refused_encoded_or_not() [io]
+    // `/safe.txt%00.jpg` truncating to `/safe.txt` is how an extension
+    // allow-list was walked past in half a dozen languages.
+    test.case("encoded")
+    test.assert(refused("/index.html%00.jpg"))
+
+    test.case("and anywhere in the path")
+    test.assert(refused("/%00"))
+    test.assert(refused("/css/%00/site.css"))
+
+@test
+fn test_a_control_byte_is_refused_because_a_log_is_evidence() [io]
+    // A newline in a file name is a newline in a log line, and a log a
+    // person can be lied to with is not evidence.
+    test.case("an encoded newline")
+    test.assert(refused("/a%0Ab.txt"))
+
+    test.case("a carriage return")
+    test.assert(refused("/a%0Db.txt"))
+
+    test.case("and a tab")
+    test.assert(refused("/a%09b.txt"))
+
+@test
+fn test_dotfiles_are_refused_by_default() [io]
+    // `.git`, `.env` and `.htpasswd` are the three most-scanned paths
+    // on the internet, and every one of them is a dotfile.
+    test.case("the three")
+    test.assert(refused("/.git/config"))
+    test.assert(refused("/.env"))
+    test.assert(refused("/.htpasswd"))
+
+    test.case("at any depth")
+    test.assert(refused("/css/.svn/entries"))
+
+    test.case("encoded, which is the same segment")
+    test.assert(refused("/%2Egit/config"))
+
+@test
+fn test_turning_dotfiles_on_is_something_a_deployment_says_out_loud() [io]
+    test.case("with the policy changed, a dotfile resolves")
+    let p = staticpath.with_hidden(staticpath.defaults())
+    match staticpath.check("/.env", p)
+        Ok(r)  => test.assert_eq_str(r, ".env")
+        Err(_) => test.assert(false)
+
+    test.case("and the default policy still refuses it")
+    match staticpath.check("/.env", staticpath.defaults())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_well_known_is_the_one_dotted_directory_that_has_to_work() [io]
+    // An ACME certificate renewal proves control of a domain through
+    // it.  A server that refuses every dotted segment refuses that
+    // too — which is a certificate that does not renew, three months
+    // after anyone was looking.
+    test.case("the predicate names it")
+    test.assert(staticpath.is_well_known(".well-known"))
+
+    test.case("and nothing else")
+    test.assert(not staticpath.is_well_known(".git"))
+    test.assert(not staticpath.is_well_known(".well-known-ish"))
+    test.assert(not staticpath.is_well_known("well-known"))
+
+@test
+fn test_the_two_ceilings_are_numbers_rather_than_paragraphs() [io]
+    // Resolving a path with four thousand segments is work an attacker
+    // chose the size of.
+    test.case("too deep")
+    var deep = ""
+    for _ in 0..64
+        deep = deep + "/a"
+    test.assert(refused(deep))
+
+    test.case("too long")
+    var long = "/"
+    for _ in 0..2000
+        long = long + "a"
+    test.assert(refused(long))
+
+    test.case("and the defaults are the numbers they claim")
+    let p = staticpath.defaults()
+    test.assert(p.max_segments == 32)
+    test.assert(p.max_bytes == 1024)
+
+@test
+fn test_a_target_that_is_not_rooted_is_named_separately_from_an_attack() [io]
+    // A caller passing something other than a request target is not
+    // somebody probing, and a log that could not tell them apart is a
+    // log nobody reads.
+    test.case("no leading slash")
+    match staticpath.check("index.html", staticpath.defaults())
+        Ok(_)  => test.assert(false)
+        Err(r) =>
+            match r
+                StaticNotRooted => test.assert(true)
+                _               => test.assert(false)
+
+    test.case("and it does not look like probing")
+    test.assert(not staticerr.looks_like_probing(staticerr.StaticNotRooted))
+    test.assert(staticerr.looks_like_probing(staticerr.StaticTraversal(0)))
+
+@test
+fn test_a_directory_without_a_trailing_slash_is_a_redirect_and_not_a_page() [io]
+    // Every relative link on a page served from `/docs` resolves
+    // against `/`; the same page served from `/docs/` resolves against
+    // `/docs/`.  A server that skips the redirect serves a page whose
+    // stylesheet 404s.
+    test.case("the redirect")
+    match staticpath.resolve("/css", staticpath.defaults(), fake_fs)
+        StaticRedirect(l)  => test.assert_eq_str(l, "/css/")
+        StaticFile(_)      => test.assert(false)
+        StaticIndex(_)     => test.assert(false)
+        StaticDirectory(_) => test.assert(false)
+        StaticRefused(_)   => test.assert(false)
+
+    test.case("and the query survives it, because it is what the person asked for")
+    test.assert_eq_str(staticpath.directory_redirect("/docs", "lang=en"), "/docs/?lang=en")
+
+    test.case("with no query, no question mark")
+    test.assert_eq_str(staticpath.directory_redirect("/docs", ""), "/docs/")
+
+@test
+fn test_a_directory_with_no_index_is_the_policys_decision_and_not_the_resolvers() [io]
+    // Listing a directory publishes every file name in it, which is
+    // how a backup file nobody meant to deploy is found.  That is a
+    // disclosure decision, not a path decision.
+    test.case("the resolver says `directory` and stops")
+    match staticpath.resolve("/docs/", staticpath.defaults(), fake_fs)
+        StaticDirectory(r) => test.assert_eq_str(r, "docs")
+        StaticFile(_)      => test.assert(false)
+        StaticIndex(_)     => test.assert(false)
+        StaticRedirect(_)  => test.assert(false)
+        StaticRefused(_)   => test.assert(false)
+
+    test.case("and listings are off by default")
+    test.assert(not staticpath.defaults().list_directories)
+    test.assert(staticpath.with_listings(staticpath.defaults()).list_directories)
+
+@test
+fn test_the_index_names_are_a_list_because_index_htm_exists() [io]
+    test.case("one by default")
+    test.assert(list.len(staticpath.defaults().index_names) == 1)
+
+    test.case("and a deployment can name more")
+    let p = staticpath.with_index_names(staticpath.defaults(),
+                                        ["index.html", "index.htm", "default.html"])
+    test.assert(list.len(p.index_names) == 3)
+
+@test
+fn test_the_individual_rules_are_published_so_a_reader_can_check_them() [io]
+    // "The resolver is safe" is not a claim a reader can check.  "This
+    // is what `..` does after decoding" is.
+    test.case("a separator inside a decoded segment")
+    test.assert(staticpath.has_separator("a/b"))
+    test.assert(staticpath.has_separator("a\\b"))
+    test.assert(not staticpath.has_separator("a-b"))
+
+    test.case("a byte no file name legitimately has")
+    test.assert(not staticpath.has_forbidden_byte("ok.txt"))
+
+    test.case("the two dot segments")
+    test.assert(staticpath.is_dot_segment("."))
+    test.assert(staticpath.is_dot_segment(".."))
+    test.assert(not staticpath.is_dot_segment("...."))
+    test.assert(not staticpath.is_dot_segment(".env"))
+
+    test.case("and a hidden one")
+    test.assert(staticpath.is_hidden(".env"))
+    test.assert(not staticpath.is_hidden("env"))
+
+@test
+fn test_a_segment_is_checked_by_one_function_a_reviewer_can_read() [io]
+    test.case("the whole rule set for one segment")
+    test.assert_some(staticpath.check_segment("..", 0, staticpath.defaults()))
+    test.assert_some(staticpath.check_segment("a/b", 0, staticpath.defaults()))
+    test.assert_some(staticpath.check_segment(".git", 0, staticpath.defaults()))
+    test.assert_none(staticpath.check_segment("site.css", 0, staticpath.defaults()))
+
+    test.case("and a file with dots in the MIDDLE is fine, which a `contains(..)` check is not")
+    test.assert_none(staticpath.check_segment("a..b.txt", 0, staticpath.defaults()))
+
+@test
+fn test_a_file_named_a_dot_dot_b_is_a_legitimate_file() [io]
+    // The standard library's own `url_to_fs_path` refuses any target
+    // containing `..` anywhere, which refuses this file — a real name
+    // that appears in archives and in generated documentation.  The
+    // rule is per SEGMENT, and this is the case that shows why.
+    test.case("not refused")
+    test.assert(not refused("/css/a..b.txt"))
+
+@test
+fn test_the_segments_are_readable_on_their_own_which_proves_the_order() [io]
+    test.case("split on literal slashes, then decoded")
+    let segs = staticpath.segments("/a/b%20c/d.txt")
+    test.assert(list.len(segs) == 3)
+    test.assert_eq_str(list.get(segs, 1, ""), "b c")
+
+    test.case("an empty target has no segments")
+    test.assert(list.len(staticpath.segments("/")) == 0)
+
+@test
+fn test_joining_a_checked_relative_path_to_a_root_is_the_only_path_built() [io]
+    test.case("the one function that produces a filesystem path")
+    test.assert_eq_str(staticpath.join_root("/srv/site", "css/site.css"),
+                       "/srv/site/css/site.css")
+
+    test.case("a root with a trailing slash does not double it")
+    test.assert_eq_str(staticpath.join_root("/srv/site/", "index.html"),
+                       "/srv/site/index.html")
+
+@test
+fn test_a_resolution_says_whether_there_is_anything_to_send() [io]
+    test.case("a file is servable")
+    test.assert(staticpath.is_servable(
+        staticpath.resolve("/css/site.css", staticpath.defaults(), fake_fs)))
+
+    test.case("a redirect is not")
+    test.assert(not staticpath.is_servable(
+        staticpath.resolve("/css", staticpath.defaults(), fake_fs)))
+
+    test.case("and the relative path is readable whichever it was")
+    test.assert_eq_str(staticpath.relative_of(
+        staticpath.resolve("/css/site.css", staticpath.defaults(), fake_fs)),
+        "css/site.css")
+
+@test
+fn test_every_refusal_is_a_404_and_the_reason_goes_in_the_log() [io]
+    // A 403 tells a prober that the path exists and they are not
+    // allowed it; a 404 tells them nothing.  No legitimate client
+    // benefits from the difference — a browser following a link never
+    // sends `..`.
+    test.case("all of them")
+    test.assert(staticerr.refusal_status(staticerr.StaticTraversal(0)) == 404)
+    test.assert(staticerr.refusal_status(staticerr.StaticHiddenSegment(0)) == 404)
+    test.assert(staticerr.refusal_status(staticerr.StaticNotRooted) == 404)
+
+    test.case("and the detail is the half a client never sees")
+    test.assert(str.len(staticerr.refusal_detail(staticerr.StaticTraversal(2))) > 0)
+
+    test.case("with the full list published as the contract")
+    test.assert(list.len(staticerr.refusal_names()) == 9)

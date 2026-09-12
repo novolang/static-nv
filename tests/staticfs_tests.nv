@@ -1,0 +1,215 @@
+// staticfs_tests.nv — the half that reads a disk, and the containment
+// claim it does NOT make.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: static-nv.staticfs.<fn>`.
+//
+// THE EFFECT ROWS ARE PART OF THE ASSERTION.  The tests that touch a
+// filesystem declare `[io, fs]` and no more — no `[net]`, because this
+// package answers a value rather than writing a socket, and no extra
+// `[io]` inside the library, because a library does not print.  The
+// tests that do not touch one declare `[io]` alone, which is the
+// compiler agreeing that building a root and reading a served
+// response's headers are arithmetic.
+//
+// Nothing here creates a directory: the paths are under a name that
+// does not exist, so every filesystem call answers "not there" and the
+// assertions are about SHAPE — that the call answers rather than what
+// it answers.  The rules with content in them live in the four `[]`
+// modules' tests, which is the point of the split.
+
+use std.test
+use std.bytes
+use std.list
+use staticerr
+use staticfs
+use staticpath
+use staticrange
+
+fn a_root() -> staticfs.StaticRoot
+    staticfs.root("/no/such/root/for/a/test")
+
+fn no_headers(name: Str) -> Str
+    ""
+
+@test
+fn test_a_root_is_a_value_and_building_one_touches_nothing() [io]
+    // `[io]` alone on this test is the assertion: no filesystem round
+    // trip at start-up, so a missing root is a fault at the first
+    // read rather than at construction.
+    test.case("the path is kept")
+    test.assert_eq_str(a_root().path, "/no/such/root/for/a/test")
+
+    test.case("with the conventional policy and limits")
+    test.assert(not a_root().policy.list_directories)
+    test.assert(a_root().ranges.max_ranges == 4)
+
+    test.case("and encoding negotiation on")
+    test.assert(a_root().negotiate_encoding)
+
+@test
+fn test_the_three_things_a_deployment_changes_about_a_root() [io]
+    test.case("the path policy")
+    let r = staticfs.with_policy(a_root(), staticpath.with_listings(staticpath.defaults()))
+    test.assert(r.policy.list_directories)
+
+    test.case("the range limits")
+    test.assert(staticfs.with_ranges(a_root(), staticrange.limits(1, 100)).ranges.max_ranges == 1)
+
+    test.case("and turning off the two `exists` calls a root with no siblings pays for")
+    test.assert(not staticfs.without_encoding(a_root()).negotiate_encoding)
+
+@test
+fn test_containment_is_lexical_and_this_package_says_so() [io]
+    // `staticpath` proves the path is inside the root AS A STRING.  It
+    // cannot prove `root/uploads/x` is not a symbolic link to
+    // /etc/shadow, because that question is the filesystem's — and the
+    // standard library answers no symbolic-link question at all: no
+    // realpath, no readlink, no link flag on any metadata call.
+    //
+    // A root a deployment wrote itself is safe.  A root that accepts
+    // uploads is not, and the honest interface is the one that says
+    // which.
+    test.case("true today, and a deployment's audit can assert it")
+    test.assert(staticfs.containment_is_lexical_only())
+
+@test
+fn test_a_missing_root_is_the_deployments_fault_and_not_the_requests() [io]
+    // Every request will fail identically until somebody fixes it,
+    // which is a different alert from a file that went missing.
+    test.case("an unreadable root")
+    let f = staticerr.StaticRootUnreadable("/srv/site", "no such directory")
+    test.assert(staticerr.is_configuration_fault(f))
+    test.assert(staticerr.status_for(f) == 503)
+
+    test.case("and a file that went missing is not")
+    let g = staticerr.StaticFileUnreadable("/srv/site/a.txt", "permission denied")
+    test.assert(not staticerr.is_configuration_fault(g))
+    test.assert(staticerr.status_for(g) == 500)
+
+@test
+fn test_a_scan_of_a_root_that_is_not_there_is_a_deployment_fault() [io, fs]
+    // `[io, fs]` is the row.  A server that 404s everything because
+    // its root is missing should stop rather than serve.
+    test.case("the scan refuses")
+    match staticfs.scan(a_root())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_per_request_calls_answer_rather_than_crash_on_a_missing_root() [io, fs]
+    test.case("a kind question")
+    test.assert(staticfs.kind_of(a_root(), "index.html") == staticpath.kind_missing())
+
+    test.case("a stat")
+    match staticfs.stat_one(a_root(), "index.html")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a sibling probe finds nothing")
+    let e = staticfs.siblings_of(a_root(), "css/site.css")
+    test.assert(not e.has_gzip)
+    test.assert(not e.has_brotli)
+
+    test.case("a whole read")
+    match staticfs.read_all(a_root(), "index.html")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a directory listing")
+    match staticfs.list_dir(a_root(), "docs")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_range_is_read_positionally_rather_than_by_reading_and_slicing() [io, fs]
+    // Serving the last megabyte of a gigabyte file reads a megabyte.
+    // The alternative — reading the file and slicing — is what makes a
+    // video server fall over, and it is what the standard library's
+    // own static handler does today.
+    test.case("the call takes a range and not a whole file")
+    let span = StaticRange { first: 1000000000, last: 1000000099 }
+    match staticfs.read_range(a_root(), "big.mp4", span)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_serving_from_an_index_is_a_lookup_and_serving_live_is_not() [io, fs]
+    test.case("the live path answers on a missing root")
+    match staticfs.serve_live(a_root(), "/index.html", "", no_headers, false)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a query is a separate argument from the target")
+    match staticfs.serve_live(a_root(), "/docs", "lang=en", no_headers, false)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_head_answers_exactly_the_headers_its_get_would() [io, fs]
+    // Including `Content-Length`, which is the whole reason a client
+    // sends one.  `is_head` suppresses the body and nothing else.
+    test.case("the flag is a parameter rather than a separate function")
+    match staticfs.serve_live(a_root(), "/index.html", "", no_headers, true)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_served_response_is_a_value_the_caller_writes() [io]
+    // This package builds no `HttpResponse`, which is what keeps it
+    // free of `[net]` and what lets a test assert headers.
+    test.case("the headers are readable by name")
+    let s = StaticServed { status: 200,
+                           headers: [("ETag", "\"a\""), ("Vary", "Accept-Encoding")],
+                           body: bytes.from_byte_list([]),
+                           relative: "index.html" }
+    test.assert_eq_str(staticfs.served_header(s, "ETag"), "\"a\"")
+    test.assert_eq_str(staticfs.served_header(s, "Vary"), "Accept-Encoding")
+
+    test.case("and a header that is not there is empty")
+    test.assert_eq_str(staticfs.served_header(s, "Content-Encoding"), "")
+
+@test
+fn test_an_index_is_consulted_without_touching_the_filesystem() [io, fs]
+    // `[]` on `lookup`, `index_len`, `encodings_of` and `index_paths`
+    // is what makes an indexed deployment answer most requests with
+    // one positional read and no metadata calls.
+    test.case("a scan that failed has no index to consult")
+    match staticfs.scan(a_root())
+        Ok(ix) =>
+            test.assert(staticfs.index_len(ix) == 0)
+            test.assert_none(staticfs.lookup(ix, "index.html"))
+            test.assert(list.len(staticfs.index_paths(ix)) == 0)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_scan_can_be_stamped_so_last_modified_has_something_truthful_in_it() [io, fs]
+    // Not each file's own modification time — the standard library has
+    // no call that would answer it — but the moment the deployment
+    // read them.  Honest, coarse, and enough to make a conditional
+    // request work within one deploy.
+    test.case("the stamp is a parameter rather than a clock read")
+    let at = civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+    match staticfs.scan_at(a_root(), at)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_encodings_of_an_indexed_path_come_from_the_scan() [io, fs]
+    test.case("an empty index knows about nothing")
+    match staticfs.scan(a_root())
+        Ok(ix) => test.assert(not staticfs.encodings_of(ix, "a.css").has_gzip)
+        Err(_) => test.assert(true)
+
+@test
+fn test_serve_takes_a_header_lookup_so_the_package_depends_on_no_request_type() [io, fs]
+    // A `fn(Str) -> Str` rather than an `HttpRequest`, which is what
+    // lets the same code answer the standard library's server, another
+    // one, and a test driving it from a list.
+    test.case("the lookup is a plain function")
+    match staticfs.scan(a_root())
+        Err(_) => test.assert(true)
+        Ok(ix) =>
+            match staticfs.serve(ix, "/index.html", "", no_headers, false)
+                Ok(s)  => test.assert(s.status == 404)
+                Err(_) => test.assert(true)

@@ -1,0 +1,307 @@
+// staticenc.nv — serving the `.gz` and `.br` the build already made,
+// and the `Vary` header without which a cache poisons itself.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS PACKAGE DOES NOT COMPRESS, AND THAT IS THE DESIGN.  A static
+// file server that gzips per request compresses the same file once per
+// requester; a build that writes `site.css` and `site.css.gz` beside
+// it compresses once per deploy, at a compression level nobody has to
+// budget for, and the server's job becomes choosing between two files
+// that already exist.  So flate-nv and brotli-nv are NAMED here and
+// are not dependencies: nothing in this package deflates anything.
+//
+// `Vary: Accept-Encoding` IS NOT OPTIONAL AND ITS ABSENCE IS A CACHE
+// POISONING.  A shared cache that stored the gzip response for
+// `/site.css` under the URL alone serves those bytes to the next
+// client — including one that sent no `Accept-Encoding` and cannot
+// decode them.  The result is a stylesheet that renders as binary for
+// everybody behind that cache until it expires.  `vary_header` is
+// published and `staticfs.serve` emits it on EVERY response, including
+// the identity ones, because the header describes the URL and not the
+// response that happened to be chosen.
+//
+// `Accept-Encoding` IS NOT A MEDIA TYPE, WHICH IS WHY mime-nv DOES NOT
+// PARSE IT.  RFC 9110 § 12.5.3's grammar is a list of `codings` with
+// q-values; § 12.5.1's `Accept` is a list of `media-range`s with
+// q-values.  The weights are the same and the tokens are not — `gzip`
+// has no `/` in it — so `mimeaccept.parse_accept` refuses the header
+// outright rather than mis-parsing it.  The parser is therefore here,
+// which is a row nobody has yet: see the README.
+//
+// THE THREE RULES § 12.5.3 CARRIES THAT IMPLEMENTATIONS SKIP:
+//
+//   · `q=0` is a REFUSAL, not a low score.  `gzip;q=0` means "do not
+//     send me gzip", and a server that treats it as "prefer others"
+//     sends gzip when nothing else is available.
+//   · `identity` is acceptable unless explicitly refused, even when
+//     the header does not mention it.  A header of `gzip` alone does
+//     NOT forbid the uncompressed file.
+//   · `*` covers what is not named — including `identity`, which is
+//     why `*;q=0` is the header that means "I will take nothing", and
+//     which a server must answer with a 406 rather than the plain
+//     file.
+
+// A content coding this package will serve, given a sibling file.
+pub enum StaticCoding
+    // The file itself.
+    StaticIdentity
+    // `<name>.gz`, served with `Content-Encoding: gzip`.
+    StaticGzip
+    // `<name>.br`, served with `Content-Encoding: br`.
+    StaticBrotli
+    // `<name>.zst`, served with `Content-Encoding: zstd`.
+    StaticZstd
+
+// What a deployment has beside a file, and what it prefers.
+pub struct StaticEncodings
+    // Whether a `.br` sibling exists.
+    has_brotli: Bool
+    // Whether a `.gz` sibling exists.
+    has_gzip: Bool
+    // Whether a `.zst` sibling exists.
+    has_zstd: Bool
+    // The order to prefer them in when a client accepts several,
+    // best first.  Brotli, zstd, gzip by default: brotli is smallest
+    // on text and every current browser accepts it, zstd is fastest to
+    // decode, gzip is what everything understands.
+    preference: [StaticCoding]
+
+// No siblings: only the file itself.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println("${staticenc.none_available().has_gzip}")
+// ```
+pub fn none_available() -> StaticEncodings []
+    todo("static-nv.staticenc.none_available")
+
+// The siblings a caller found, with the conventional preference.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println("${staticenc.available(true, true, false).has_brotli}")
+// ```
+pub fn available(brotli: Bool, gzip: Bool, zstd: Bool) -> StaticEncodings []
+    todo("static-nv.staticenc.available")
+
+// The same, with a preference order the deployment chose.
+//
+// For the deployment that measured its own traffic and found gzip
+// cheaper to serve than brotli from a cold cache.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     let e = staticenc.with_preference(staticenc.available(true, true, false),
+//                                       [staticenc.StaticGzip, staticenc.StaticBrotli])
+//     println("${e.has_gzip}")
+// ```
+pub fn with_preference(e: StaticEncodings, order: [StaticCoding]) -> StaticEncodings []
+    todo("static-nv.staticenc.with_preference")
+
+// ── The header ───────────────────────────────────────────────────────
+
+// The coding to serve, given an `Accept-Encoding` header and what is
+// available.
+//
+// `None` means **406**: the client refused everything on offer,
+// including `identity`, which only a header carrying `*;q=0` or
+// `identity;q=0` can do.  It is rare and it is a real answer — a
+// server that sent the plain file anyway would be sending bytes the
+// client said it would not take.
+//
+// An EMPTY or ABSENT header answers `StaticIdentity`: § 12.5.3 says a
+// request without the field accepts any encoding, and identity is the
+// safe reading of "any".
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     match staticenc.choose("gzip, br", staticenc.available(true, true, false))
+//         Some(c) => println(staticenc.coding_name(c))
+//         None    => println("406 — nothing on offer is acceptable")
+// ```
+pub fn choose(accept_encoding: Str, e: StaticEncodings) -> ?StaticCoding []
+    todo("static-nv.staticenc.choose")
+
+// The quality a header assigns a named coding, in thousandths.
+//
+// 1000 for an unweighted match, 0 for a refusal, and the `*` fallback
+// where the coding is not named.  `-1` where neither the coding nor
+// `*` appears, which is how a caller tells "not mentioned" from
+// "mentioned with q=0" — and the two mean opposite things for
+// `identity`.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println("${staticenc.quality_of("gzip;q=0.5, *;q=0", "gzip")}")
+// ```
+pub fn quality_of(accept_encoding: Str, coding: Str) -> Int []
+    todo("static-nv.staticenc.quality_of")
+
+// Whether a header forbids the uncompressed file.
+//
+// The one question with a counter-intuitive answer: a header of
+// `gzip` ALONE does not forbid identity.  § 12.5.3 makes identity
+// acceptable unless explicitly refused, so only `identity;q=0` or a
+// `*;q=0` with no identity exception does it — and a server that read
+// "gzip" as "gzip only" would 406 a client that would have been
+// perfectly happy.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println("${staticenc.identity_refused("gzip")}")
+// ```
+pub fn identity_refused(accept_encoding: Str) -> Bool []
+    todo("static-nv.staticenc.identity_refused")
+
+// Whether a coding was explicitly refused with `q=0`.
+//
+// `gzip;q=0` means "do not send me gzip", and a server that reads it
+// as a low preference sends gzip whenever nothing else is available —
+// to a client that asked it not to.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println("${staticenc.is_refused("gzip;q=0, br", "gzip")}")
+// ```
+pub fn is_refused(accept_encoding: Str, coding: Str) -> Bool []
+    todo("static-nv.staticenc.is_refused")
+
+// ── Naming ───────────────────────────────────────────────────────────
+
+// The `Content-Encoding` token for a coding: `gzip`, `br`, `zstd`, or
+// empty for identity.
+//
+// Empty rather than the literal `identity`, because § 8.4 says a
+// representation with no encoding carries no `Content-Encoding` field
+// at all — and a server that emits `Content-Encoding: identity` has
+// sent a header some intermediaries handle badly for no benefit.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println(staticenc.coding_name(staticenc.StaticBrotli))
+// ```
+pub fn coding_name(c: StaticCoding) -> Str []
+    todo("static-nv.staticenc.coding_name")
+
+// The filename suffix for a coding: `.gz`, `.br`, `.zst`, or empty.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println(staticenc.coding_suffix(staticenc.StaticGzip))
+// ```
+pub fn coding_suffix(c: StaticCoding) -> Str []
+    todo("static-nv.staticenc.coding_suffix")
+
+// The sibling path for a relative path and a coding.
+//
+// `css/site.css` plus gzip is `css/site.css.gz`.  The suffix goes on
+// the END, after the extension, which is what every build tool does
+// and what keeps `mime-nv` answering `text/css` for the original
+// name — the media type of a gzip-encoded stylesheet is still
+// `text/css`, and a server that answered `application/gzip` would
+// hand a browser a file it downloads instead of applying.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println(staticenc.sibling_path("css/site.css", staticenc.StaticGzip))
+// ```
+pub fn sibling_path(relative: Str, c: StaticCoding) -> Str []
+    todo("static-nv.staticenc.sibling_path")
+
+// The coding a filename's suffix names, or identity.
+//
+// The inverse of `sibling_path`, for a caller walking a build's output
+// and deciding which files are siblings of which.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println(staticenc.coding_of_path("css/site.css.br") == staticenc.StaticBrotli)
+// ```
+pub fn coding_of_path(path: Str) -> StaticCoding []
+    todo("static-nv.staticenc.coding_of_path")
+
+// The `Vary` header every response from a negotiating server carries.
+//
+// `Accept-Encoding`.  Emitted on EVERY response, including the
+// uncompressed ones, because the header describes what varies at this
+// URL and not what happened on this request.  A shared cache that
+// stored a gzip response without it serves those bytes to a client
+// that cannot decode them — which is a stylesheet rendering as binary
+// for everybody behind that cache until it expires.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println(staticenc.vary_header())
+// ```
+pub fn vary_header() -> Str []
+    todo("static-nv.staticenc.vary_header")
+
+// The status for a client that refused everything: 406.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println("${staticenc.not_acceptable_status()}")
+// ```
+pub fn not_acceptable_status() -> Int []
+    todo("static-nv.staticenc.not_acceptable_status")
+
+// Whether a media type is worth compressing at all.
+//
+// False for what is already compressed — an image, a video, a zip, a
+// woff2 — where a `.gz` sibling is larger than the original and the
+// round trip through a decoder is spent for nothing.  Published so a
+// BUILD can use the same rule the server does, which is what stops a
+// deployment shipping ten thousand useless `.gz` files.
+//
+// ```novo
+// use staticenc
+//
+// fn main() [io]
+//     println("${staticenc.worth_compressing("image/png")}")
+// ```
+pub fn worth_compressing(content_type: Str) -> Bool []
+    todo("static-nv.staticenc.worth_compressing")
+
+// The codecs a `.gz`, `.br` or `.zst` sibling was produced with, named
+// so a reader knows what this package is NOT doing.
+//
+// flate-nv writes the first, brotli-nv the second, zstd-nv the third —
+// in a BUILD.  Nothing here calls any of them; this list is the
+// documentation of that boundary, printable in a diagnostic.
+//
+// ```novo
+// use std.list
+// use staticenc
+//
+// fn main() [io]
+//     println("${list.len(staticenc.producing_packages())}")
+// ```
+pub fn producing_packages() -> [Str] []
+    todo("static-nv.staticenc.producing_packages")

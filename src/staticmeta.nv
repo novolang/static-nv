@@ -1,0 +1,516 @@
+// staticmeta.nv — the validators, the conditional requests they
+// answer, and the cache headers that decide whether a request happens
+// at all.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ETAG IS A CONTENT HASH, AND THAT IS NOT THE DEFAULT ANYBODY
+// WOULD CHOOSE.  Every other static file server computes a WEAK
+// validator from the file's size and its modification time: it is one
+// stat call, it is right almost always, and it costs nothing.
+//
+// This package cannot.  **The standard library answers no modification
+// time at all** — `std.fs` has `size`, `exists`, `is_file`, `read_at`
+// and no stat, and `std.path` has no metadata either.  A size-and-mtime
+// validator is not a thing that can be computed here.
+//
+// So the validator is `sha256` of the content, which is a STRONG one:
+// correct by construction, usable for a range request's `If-Range`
+// (a weak validator is not, RFC 9110 § 13.1.5), and expensive on a
+// large file.  That expense is why `StaticEntry` exists and why
+// `staticfs.scan` builds an index once: the hash is computed at
+// start-up, per file, and every request after that is a comparison.
+//
+// The alternative, for a deployment that cannot afford the scan, is
+// `entry_with_etag`: a validator the BUILD computed — a content hash
+// in a manifest, a deploy identifier, a commit — which is the shape a
+// static site generator already has.
+//
+// `Last-Modified` has the same root and a different consequence.  With
+// no modification time there is nothing truthful to put in it, so this
+// package emits it only from a time the caller supplied through
+// `with_modified`, and `entry` leaves it absent rather than inventing
+// one.  An absent
+// `Last-Modified` costs nothing: `ETag` and `If-None-Match` do the
+// whole job, and RFC 9110 § 13.1.3 makes `If-Modified-Since` the
+// weaker of the two anyway.  Both gaps are filed against the standard
+// library rather than worked around.
+//
+// THE PRECEDENCE OF CONDITIONAL HEADERS IS RFC 9110 § 13.2.2, AND IT
+// IS NOT THE ORDER THEY ARRIVE IN.  `If-Match` before
+// `If-Unmodified-Since` before `If-None-Match` before
+// `If-Modified-Since` before `If-Range` — and `If-None-Match`
+// OVERRIDES `If-Modified-Since` when both are present, which is the
+// rule implementations skip and the reason a browser that sends both
+// gets a 200 from servers that should have sent it a 304.
+// `evaluate` is that whole table in one function.
+
+use civil
+
+// What a caller knows about one file.
+//
+// Built by `staticfs.scan` or `staticfs.stat`, and cheap to hold: a
+// deployment keeps a table of these and answers most requests without
+// opening anything.
+pub struct StaticEntry
+    // The path relative to the root.
+    relative: Str
+    // The size in bytes.  What `Content-Length` says and what a
+    // `Range` is measured against.
+    size: Int
+    // The entity tag, quoted and ready for a header: `"abc123"`.
+    etag: Str
+    // Whether the tag is weak (`W/"…"`).  A weak tag may not answer
+    // `If-Range`, so a range request against one serves the whole file
+    // — correctly, and the flag is what makes that decision rather
+    // than a string comparison somewhere.
+    etag_weak: Bool
+    // The media type, from mime-nv.
+    content_type: Str
+    // When the file last changed, where the caller knows.  Absent by
+    // default; see the module comment.
+    modified_at: ?civil.CivilDateTime
+
+// How long a client and a cache may keep a response.
+pub struct StaticCache
+    // Seconds for `max-age`.
+    max_age: Int
+    // Whether a shared cache may keep it (`public`) or only the client
+    // (`private`).
+    shareable: Bool
+    // Whether the content at this URL can never change, which is what
+    // `immutable` means — and it is a promise, not a hint: a browser
+    // holding an immutable response will not revalidate it even when
+    // the person presses reload.
+    immutable: Bool
+    // Whether a cache must revalidate once the age is past
+    // (`must-revalidate`).
+    must_revalidate: Bool
+
+// ── Building an entry ────────────────────────────────────────────────
+
+// An entry with the validator computed from the bytes.
+//
+// `sha256`, truncated and hex-encoded into a strong tag.  The
+// expensive constructor, and the correct one: a strong validator
+// answers `If-Range` as well as `If-None-Match`, which a weak one may
+// not.
+//
+// ```novo
+// use std.bytes
+// use staticmeta
+//
+// fn main() [io]
+//     let e = staticmeta.entry("css/site.css", bytes.from_byte_list([1, 2, 3]))
+//     println(e.etag)
+// ```
+pub fn entry(relative: Str, content: Bytes) -> StaticEntry []
+    todo("static-nv.staticmeta.entry")
+
+// An entry with a validator the caller already has.
+//
+// For the deployment whose build wrote a manifest — a content hash, a
+// bundle identifier, a commit — which is the shape a static site
+// generator already produces.  The tag is used verbatim, so the caller
+// is responsible for its quoting; `quote_etag` is here for that.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     let e = staticmeta.entry_with_etag("css/site.css", 4096,
+//                                        staticmeta.quote_etag("b1946ac9"), false)
+//     println(e.etag)
+// ```
+pub fn entry_with_etag(relative: Str, size: Int, etag: Str, is_weak: Bool) -> StaticEntry []
+    todo("static-nv.staticmeta.entry_with_etag")
+
+// The same entry with a modification time.
+//
+// The only way a `Last-Modified` header comes out of this package: the
+// caller knows when the file changed — a build stamp, a deploy time, a
+// manifest — and says so.  Nothing here invents one.
+//
+// ```novo
+// use civil
+// use std.bytes
+// use staticmeta
+//
+// fn main() [io]
+//     let at = civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+//     let e = staticmeta.entry("a.txt", bytes.from_byte_list([1]))
+//     println("${staticmeta.has_modified(staticmeta.with_modified(e, at))}")
+// ```
+pub fn with_modified(e: StaticEntry, at: civil.CivilDateTime) -> StaticEntry []
+    todo("static-nv.staticmeta.with_modified")
+
+// Whether an entry knows when its file changed.
+//
+// ```novo
+// use std.bytes
+// use staticmeta
+//
+// fn main() [io]
+//     println("${staticmeta.has_modified(staticmeta.entry("a", bytes.from_byte_list([1])))}")
+// ```
+pub fn has_modified(e: StaticEntry) -> Bool []
+    todo("static-nv.staticmeta.has_modified")
+
+// The same entry with a media type the caller chose.
+//
+// For the file whose extension does not say what it is — a `.data`
+// blob, a file with no extension at all — and for overriding a
+// sniffing result a deployment disagrees with.
+//
+// ```novo
+// use std.bytes
+// use staticmeta
+//
+// fn main() [io]
+//     let e = staticmeta.entry("blob", bytes.from_byte_list([1]))
+//     println(staticmeta.with_type(e, "application/octet-stream").content_type)
+// ```
+pub fn with_type(e: StaticEntry, content_type: Str) -> StaticEntry []
+    todo("static-nv.staticmeta.with_type")
+
+// ── Entity tags ──────────────────────────────────────────────────────
+
+// A bare token as a quoted entity tag: `abc` becomes `"abc"`.
+//
+// RFC 9110 § 8.8.3's `entity-tag` is quoted, and a server that emits
+// an unquoted one emits a header a conforming cache ignores — which
+// means every request is a full download and nothing says why.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println(staticmeta.quote_etag("b1946ac9"))
+// ```
+pub fn quote_etag(token: Str) -> Str []
+    todo("static-nv.staticmeta.quote_etag")
+
+// The same, marked weak: `W/"abc"`.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println(staticmeta.quote_etag_weak("b1946ac9"))
+// ```
+pub fn quote_etag_weak(token: Str) -> Str []
+    todo("static-nv.staticmeta.quote_etag_weak")
+
+// Whether two entity tags match under RFC 9110 § 8.8.3.1's STRONG
+// comparison: byte-identical, and neither weak.
+//
+// What `If-Range` requires.  A weak tag means "these two
+// representations are equivalent for caching" and NOT "these two
+// byte sequences are the same" — so answering a range request from one
+// can splice two different files together in a client's buffer.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println("${staticmeta.etag_strong_eq("\"a\"", "\"a\"")}")
+// ```
+pub fn etag_strong_eq(a: Str, b: Str) -> Bool []
+    todo("static-nv.staticmeta.etag_strong_eq")
+
+// Whether two entity tags match under the WEAK comparison: the same
+// opaque tag, weakness ignored.
+//
+// What `If-None-Match` uses.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println("${staticmeta.etag_weak_eq("W/\"a\"", "\"a\"")}")
+// ```
+pub fn etag_weak_eq(a: Str, b: Str) -> Bool []
+    todo("static-nv.staticmeta.etag_weak_eq")
+
+// The tags an `If-None-Match` or `If-Match` header lists.
+//
+// A comma-separated list, or the single token `*`.  Answers the `*`
+// case as a one-element list holding it, so a caller matches on the
+// value rather than checking a flag.
+//
+// ```novo
+// use std.list
+// use staticmeta
+//
+// fn main() [io]
+//     println("${list.len(staticmeta.parse_etag_list("\"a\", W/\"b\""))}")
+// ```
+pub fn parse_etag_list(header: Str) -> [Str] []
+    todo("static-nv.staticmeta.parse_etag_list")
+
+// ── HTTP dates ───────────────────────────────────────────────────────
+
+// A civil date-time as RFC 9110 § 5.6.7's IMF-fixdate:
+// `Sun, 06 Nov 1994 08:49:37 GMT`.
+//
+// The ONE format a server may emit.  § 5.6.7 is explicit: a sender
+// must use it, and the other two exist only so a recipient can read
+// what older senders produced.
+//
+// ```novo
+// use civil
+// use staticmeta
+//
+// fn main() [io]
+//     let at = civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+//     println(staticmeta.format_http_date(at))
+// ```
+pub fn format_http_date(at: civil.CivilDateTime) -> Str []
+    todo("static-nv.staticmeta.format_http_date")
+
+// An HTTP date in any of the THREE formats § 5.6.7 requires a
+// recipient to accept.
+//
+// IMF-fixdate, the obsolete RFC 850 form (`Sunday, 06-Nov-94 08:49:37
+// GMT`) and asctime (`Sun Nov  6 08:49:37 1994`).  A server that reads
+// only the first answers 200 with a whole file to a client that sent
+// one of the other two — which is a cache that never hits and a
+// bandwidth bill nobody can explain.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     match staticmeta.parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT")
+//         Some(d) => println("${d.date.year}")
+//         None    => println("not a date this package reads")
+// ```
+pub fn parse_http_date(text: Str) -> ?civil.CivilDateTime []
+    todo("static-nv.staticmeta.parse_http_date")
+
+// The three date formats this package accepts, as strings a person can
+// read.
+//
+// The list IS the contract, and printing it in a diagnostic is what
+// tells a deployment why a client's conditional request did not match.
+//
+// ```novo
+// use std.list
+// use staticmeta
+//
+// fn main() [io]
+//     println("${list.len(staticmeta.http_date_formats())}")
+// ```
+pub fn http_date_formats() -> [Str] []
+    todo("static-nv.staticmeta.http_date_formats")
+
+// ── Conditional requests ─────────────────────────────────────────────
+
+// What a conditional request asked for.
+pub struct StaticConditions
+    // `If-Match`, empty where absent.
+    if_match: Str
+    // `If-None-Match`, empty where absent.
+    if_none_match: Str
+    // `If-Modified-Since`, empty where absent.
+    if_modified_since: Str
+    // `If-Unmodified-Since`, empty where absent.
+    if_unmodified_since: Str
+    // `If-Range`, empty where absent.
+    if_range: Str
+
+// No conditions: what an unconditional request carries.
+//
+// ```novo
+// use std.bytes
+// use staticmeta
+//
+// fn an_entry() -> staticmeta.StaticEntry
+//     staticmeta.entry("css/site.css", bytes.from_byte_list([1, 2, 3]))
+//
+// fn main() [io]
+//     println("${staticmeta.evaluate(staticmeta.no_conditions(), an_entry(), false)}")
+// ```
+pub fn no_conditions() -> StaticConditions []
+    todo("static-nv.staticmeta.no_conditions")
+
+// Conditions read from a request's headers, as a lookup the caller
+// supplies.
+//
+// The lookup is a `fn(Str) -> Str` answering a header by name, empty
+// where absent — which is `http.server.headers_get_or` with a default
+// of `""`, and which a test supplies from a list.  A function rather
+// than a header type so this package depends on nobody's request
+// value.
+//
+// ```novo
+// use std.bytes
+// use staticmeta
+//
+// fn an_entry() -> staticmeta.StaticEntry
+//     staticmeta.entry("css/site.css", bytes.from_byte_list([1, 2, 3]))
+//
+// fn no_headers(name: Str) -> Str
+//     ""
+//
+// fn main() [io]
+//     println("${staticmeta.evaluate(staticmeta.conditions_of(no_headers), an_entry(), false)}")
+// ```
+pub fn conditions_of(header: fn(Str) -> Str []) -> StaticConditions []
+    todo("static-nv.staticmeta.conditions_of")
+
+// What the conditions say to answer, as a status code.
+//
+// **RFC 9110 § 13.2.2's precedence, whole**, which is the reason this
+// is one function rather than five predicates a caller sequences:
+//
+//   1. `If-Match` fails    → 412
+//   2. `If-Unmodified-Since` fails (and no `If-Match`) → 412
+//   3. `If-None-Match` fails → 304 for GET/HEAD, 412 otherwise
+//   4. `If-Modified-Since` fails, **and there was no `If-None-Match`**
+//      → 304
+//   5. otherwise → 200
+//
+// Step 4's parenthesis is the rule implementations skip.  A browser
+// revalidating sends both headers; a server that checks
+// `If-Modified-Since` independently answers 200 to a request it should
+// have answered 304 for, on every revalidation, forever.
+//
+// `is_read` distinguishes GET and HEAD from the methods where a failed
+// `If-None-Match` is a 412 rather than a 304.
+//
+// ```novo
+// use std.bytes
+// use staticmeta
+//
+// fn an_entry() -> staticmeta.StaticEntry
+//     staticmeta.entry("css/site.css", bytes.from_byte_list([1, 2, 3]))
+//
+// fn main() [io]
+//     println("${staticmeta.evaluate(staticmeta.no_conditions(), an_entry(), true)}")
+// ```
+pub fn evaluate(c: StaticConditions, e: StaticEntry, is_read: Bool) -> Int []
+    todo("static-nv.staticmeta.evaluate")
+
+// Whether a request's `If-Range` permits a range to be answered.
+//
+// `true` where there is no `If-Range` at all, and where the tag
+// matches under the STRONG comparison or the date matches exactly.
+// `false` otherwise — and a false answer means serve the WHOLE file
+// with a 200, not a 412: RFC 9110 § 13.1.5 makes `If-Range` a
+// "give me the range only if nothing changed, otherwise give me
+// everything" header, which is what makes a resumed download safe.
+//
+// A weak entity tag never satisfies it, because "equivalent for
+// caching" is not "the same bytes", and splicing a range from a
+// different representation into a client's buffer produces a file that
+// is corrupt in the middle with a valid length.
+//
+// ```novo
+// use std.bytes
+// use staticmeta
+//
+// fn an_entry() -> staticmeta.StaticEntry
+//     staticmeta.entry("css/site.css", bytes.from_byte_list([1, 2, 3]))
+//
+// fn main() [io]
+//     println("${staticmeta.range_allowed(staticmeta.no_conditions(), an_entry())}")
+// ```
+pub fn range_allowed(c: StaticConditions, e: StaticEntry) -> Bool []
+    todo("static-nv.staticmeta.range_allowed")
+
+// ── Cache-Control ────────────────────────────────────────────────────
+
+// The preset for a file whose name changes when its content does — a
+// bundle with a hash in it, `site.a1b2c3.css`.
+//
+// One year, `public`, `immutable`.  The strongest promise there is,
+// and it is safe exactly here: a client holding this response will not
+// ask again, and it does not have to, because a changed file has a
+// different name.
+//
+// Do NOT use it on a file whose name is stable: `immutable` means a
+// browser ignores a reload, and a deployment that gets this wrong has
+// no way to correct it short of renaming the file.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println(staticmeta.cache_header(staticmeta.fingerprinted()))
+// ```
+pub fn fingerprinted() -> StaticCache []
+    todo("static-nv.staticmeta.fingerprinted")
+
+// The preset for a file whose name is stable and whose content
+// changes: an HTML page, a stylesheet without a hash.
+//
+// `no-cache`, which does NOT mean "do not store" — it means "store it,
+// and revalidate before using it".  With an `ETag` that revalidation
+// is a 304 with no body, so the cost is a round trip rather than a
+// download, and the content is never stale.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println(staticmeta.cache_header(staticmeta.revalidated()))
+// ```
+pub fn revalidated() -> StaticCache []
+    todo("static-nv.staticmeta.revalidated")
+
+// The preset for something a shared cache must not keep: a page
+// rendered for one signed-in person.
+//
+// `private, no-store`.  Rare in a static file server and here because
+// a root can hold something it should not — and because the header a
+// deployment reaches for by hand is usually one of these three.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println(staticmeta.cache_header(staticmeta.uncached()))
+// ```
+pub fn uncached() -> StaticCache []
+    todo("static-nv.staticmeta.uncached")
+
+// A preset with a caller's own age.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println(staticmeta.cache_header(staticmeta.cached_for(3600)))
+// ```
+pub fn cached_for(max_age_secs: Int) -> StaticCache []
+    todo("static-nv.staticmeta.cached_for")
+
+// A `Cache-Control` header value.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println(staticmeta.cache_header(staticmeta.cached_for(60)))
+// ```
+pub fn cache_header(c: StaticCache) -> Str []
+    todo("static-nv.staticmeta.cache_header")
+
+// Whether a relative path looks like it carries a content
+// fingerprint — `site.a1b2c3d4.css`, `app-9f8e7d.js`.
+//
+// A heuristic, and it says so: a deployment choosing `fingerprinted()`
+// on the strength of it is promising `immutable` about a file this
+// function guessed at.  Published because the guess is one every
+// static file server makes, and one written here is one a test can
+// pin.
+//
+// ```novo
+// use staticmeta
+//
+// fn main() [io]
+//     println("${staticmeta.looks_fingerprinted("site.a1b2c3d4.css")}")
+// ```
+pub fn looks_fingerprinted(relative: Str) -> Bool []
+    todo("static-nv.staticmeta.looks_fingerprinted")

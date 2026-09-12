@@ -1,0 +1,286 @@
+// staticmeta_tests.nv — the validators, and RFC 9110 § 13.2.2's
+// precedence in full.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: static-nv.staticmeta.<fn>`.
+//
+// THE PRECEDENCE TABLE IS THE POINT OF THIS FILE.  Five conditional
+// headers, one order, and one rule — `If-None-Match` overrides
+// `If-Modified-Since` — that implementations skip and that costs a
+// browser a full download on every revalidation when they do.
+
+use std.test
+use std.bytes
+use std.list
+use std.str
+use civil
+use staticmeta
+
+fn t0() -> civil.CivilDateTime
+    civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+
+fn an_entry() -> staticmeta.StaticEntry
+    staticmeta.entry_with_etag("css/site.css", 4096,
+                               staticmeta.quote_etag("b1946ac9"), false)
+
+fn a_weak_entry() -> staticmeta.StaticEntry
+    staticmeta.entry_with_etag("css/site.css", 4096,
+                               staticmeta.quote_etag_weak("b1946ac9"), true)
+
+// A header lookup backed by a list, which is what makes the whole
+// precedence table testable with no request in the room.
+fn headers_of(pairs: [(Str, Str)]) -> fn(Str) -> Str []
+    name =>
+        var found = ""
+        for p in pairs
+            if p.0 == name
+                found = p.1
+        found
+
+@test
+fn test_an_etag_is_quoted_because_an_unquoted_one_is_ignored() [io]
+    // RFC 9110 § 8.8.3's `entity-tag` is quoted.  A server emitting an
+    // unquoted one emits a header a conforming cache ignores, which
+    // means every request is a full download and nothing says why.
+    test.case("strong")
+    test.assert_eq_str(staticmeta.quote_etag("b1946ac9"), "\"b1946ac9\"")
+
+    test.case("weak")
+    test.assert_eq_str(staticmeta.quote_etag_weak("b1946ac9"), "W/\"b1946ac9\"")
+
+@test
+fn test_the_content_hash_is_a_strong_validator_and_that_is_why_it_is_the_default() [io]
+    // The standard library answers no modification time, so
+    // size-and-mtime is not a validator this package could compute.
+    // A content hash is the honest alternative and it happens to be
+    // the better one: a strong tag answers `If-Range`, a weak one may
+    // not.
+    test.case("an entry built from bytes is strong")
+    let e = staticmeta.entry("a.txt", bytes.from_byte_list([1, 2, 3]))
+    test.assert(not e.etag_weak)
+
+    test.case("two identical files get the same tag")
+    let f = staticmeta.entry("b.txt", bytes.from_byte_list([1, 2, 3]))
+    test.assert_eq_str(e.etag, f.etag)
+
+    test.case("and two different ones do not")
+    let g = staticmeta.entry("c.txt", bytes.from_byte_list([1, 2, 4]))
+    test.assert(e.etag != g.etag)
+
+@test
+fn test_a_build_supplied_validator_is_the_affordable_alternative() [io]
+    // A static site generator already writes a manifest with a hash in
+    // it; hashing every file again at start-up is work already done.
+    test.case("the tag is used verbatim")
+    test.assert_eq_str(an_entry().etag, "\"b1946ac9\"")
+    test.assert(an_entry().size == 4096)
+
+@test
+fn test_the_two_comparisons_are_not_the_same_comparison() [io]
+    // A weak tag means "equivalent for caching", NOT "the same bytes".
+    // Answering a range request from one can splice two different
+    // representations together in a client's buffer.
+    test.case("strong: byte-identical and neither weak")
+    test.assert(staticmeta.etag_strong_eq("\"a\"", "\"a\""))
+    test.assert(not staticmeta.etag_strong_eq("W/\"a\"", "\"a\""))
+    test.assert(not staticmeta.etag_strong_eq("W/\"a\"", "W/\"a\""))
+
+    test.case("weak: the same opaque tag, weakness ignored")
+    test.assert(staticmeta.etag_weak_eq("W/\"a\"", "\"a\""))
+    test.assert(staticmeta.etag_weak_eq("W/\"a\"", "W/\"a\""))
+    test.assert(not staticmeta.etag_weak_eq("\"a\"", "\"b\""))
+
+@test
+fn test_an_etag_list_is_a_list_and_the_star_is_in_it() [io]
+    test.case("several tags")
+    test.assert(list.len(staticmeta.parse_etag_list("\"a\", W/\"b\", \"c\"")) == 3)
+
+    test.case("the star, as a one-element list rather than a flag")
+    let star = staticmeta.parse_etag_list("*")
+    test.assert(list.len(star) == 1)
+    test.assert_eq_str(list.get(star, 0, ""), "*")
+
+    test.case("and an empty header is an empty list")
+    test.assert(list.len(staticmeta.parse_etag_list("")) == 0)
+
+@test
+fn test_a_server_emits_one_date_format_and_reads_three() [io]
+    // § 5.6.7 is explicit: a sender must use IMF-fixdate; the other
+    // two exist so a recipient can read what older senders produced.
+    // A server that reads only the first answers 200 with a whole file
+    // to a client that sent one of the others — a cache that never
+    // hits and a bandwidth bill nobody can explain.
+    test.case("three formats accepted")
+    test.assert(list.len(staticmeta.http_date_formats()) == 3)
+
+    test.case("IMF-fixdate")
+    test.assert_some(staticmeta.parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"))
+
+    test.case("the obsolete RFC 850 form")
+    test.assert_some(staticmeta.parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"))
+
+    test.case("and asctime, whose day is space-padded")
+    test.assert_some(staticmeta.parse_http_date("Sun Nov  6 08:49:37 1994"))
+
+    test.case("something else is not a date")
+    test.assert_none(staticmeta.parse_http_date("1994-11-06T08:49:37Z"))
+
+@test
+fn test_only_imf_fixdate_is_written() [io]
+    test.case("the one format a sender may use")
+    let out = staticmeta.format_http_date(t0())
+    test.assert(str.contains(out, "GMT"))
+    test.assert(str.contains(out, ","))
+
+@test
+fn test_an_unconditional_request_is_a_200() [io]
+    test.case("no conditions at all")
+    test.assert(staticmeta.evaluate(staticmeta.no_conditions(), an_entry(), true) == 200)
+
+@test
+fn test_if_none_match_that_matches_is_a_304() [io]
+    test.case("the same tag")
+    let c = staticmeta.conditions_of(headers_of([("If-None-Match", "\"b1946ac9\"")]))
+    test.assert(staticmeta.evaluate(c, an_entry(), true) == 304)
+
+    test.case("a different tag is a 200")
+    let c2 = staticmeta.conditions_of(headers_of([("If-None-Match", "\"other\"")]))
+    test.assert(staticmeta.evaluate(c2, an_entry(), true) == 200)
+
+    test.case("the star matches anything that exists")
+    let c3 = staticmeta.conditions_of(headers_of([("If-None-Match", "*")]))
+    test.assert(staticmeta.evaluate(c3, an_entry(), true) == 304)
+
+    test.case("and on a method that is not a read it is a 412 rather than a 304")
+    test.assert(staticmeta.evaluate(c, an_entry(), false) == 412)
+
+@test
+fn test_if_none_match_overrides_if_modified_since_and_this_is_the_rule_everybody_skips() [io]
+    // A browser revalidating sends BOTH headers.  A server that
+    // checks `If-Modified-Since` independently answers 200 to a
+    // request it should have answered 304 for — on every revalidation,
+    // forever.
+    test.case("the tag matches and the date says modified: still a 304")
+    let c = staticmeta.conditions_of(headers_of([
+        ("If-None-Match", "\"b1946ac9\""),
+        ("If-Modified-Since", "Sun, 06 Nov 1994 08:49:37 GMT")]))
+    let e = staticmeta.with_modified(an_entry(), t0())
+    test.assert(staticmeta.evaluate(c, e, true) == 304)
+
+    test.case("the tag does NOT match and the date says unmodified: a 200")
+    let c2 = staticmeta.conditions_of(headers_of([
+        ("If-None-Match", "\"other\""),
+        ("If-Modified-Since", "Sun, 06 Nov 2094 08:49:37 GMT")]))
+    test.assert(staticmeta.evaluate(c2, e, true) == 200)
+
+@test
+fn test_if_modified_since_alone_still_works() [io]
+    test.case("a date after the file's modification time is a 304")
+    let e = staticmeta.with_modified(an_entry(), t0())
+    let c = staticmeta.conditions_of(headers_of([
+        ("If-Modified-Since", "Sun, 06 Nov 2094 08:49:37 GMT")]))
+    test.assert(staticmeta.evaluate(c, e, true) == 304)
+
+    test.case("and an entry with no modification time cannot answer it, so 200")
+    let c2 = staticmeta.conditions_of(headers_of([
+        ("If-Modified-Since", "Sun, 06 Nov 2094 08:49:37 GMT")]))
+    test.assert(staticmeta.evaluate(c2, an_entry(), true) == 200)
+
+@test
+fn test_if_match_comes_first_and_a_failure_is_a_412() [io]
+    test.case("a tag that does not match")
+    let c = staticmeta.conditions_of(headers_of([("If-Match", "\"other\"")]))
+    test.assert(staticmeta.evaluate(c, an_entry(), true) == 412)
+
+    test.case("and it outranks If-None-Match, which would have said 304")
+    let c2 = staticmeta.conditions_of(headers_of([
+        ("If-Match", "\"other\""),
+        ("If-None-Match", "\"b1946ac9\"")]))
+    test.assert(staticmeta.evaluate(c2, an_entry(), true) == 412)
+
+@test
+fn test_if_unmodified_since_is_checked_only_where_there_is_no_if_match() [io]
+    test.case("a date before the modification time is a 412")
+    let e = staticmeta.with_modified(an_entry(), t0())
+    let c = staticmeta.conditions_of(headers_of([
+        ("If-Unmodified-Since", "Sun, 06 Nov 1994 08:49:37 GMT")]))
+    test.assert(staticmeta.evaluate(c, e, true) == 412)
+
+    test.case("and an If-Match that PASSES makes it irrelevant")
+    let c2 = staticmeta.conditions_of(headers_of([
+        ("If-Match", "\"b1946ac9\""),
+        ("If-Unmodified-Since", "Sun, 06 Nov 1994 08:49:37 GMT")]))
+    test.assert(staticmeta.evaluate(c2, e, true) == 200)
+
+@test
+fn test_if_range_takes_a_strong_validator_or_nothing() [io]
+    // "Give me the range only if nothing changed, otherwise give me
+    // everything" — which is what makes a resumed download safe.  A
+    // weak tag never satisfies it, because splicing a range from a
+    // different representation into a client's buffer produces a file
+    // that is corrupt in the middle with a valid length.
+    test.case("no If-Range at all permits the range")
+    test.assert(staticmeta.range_allowed(staticmeta.no_conditions(), an_entry()))
+
+    test.case("a matching strong tag permits it")
+    let c = staticmeta.conditions_of(headers_of([("If-Range", "\"b1946ac9\"")]))
+    test.assert(staticmeta.range_allowed(c, an_entry()))
+
+    test.case("a matching WEAK tag does not")
+    let c2 = staticmeta.conditions_of(headers_of([("If-Range", "W/\"b1946ac9\"")]))
+    test.assert(not staticmeta.range_allowed(c2, a_weak_entry()))
+
+    test.case("and a tag that does not match does not")
+    let c3 = staticmeta.conditions_of(headers_of([("If-Range", "\"other\"")]))
+    test.assert(not staticmeta.range_allowed(c3, an_entry()))
+
+@test
+fn test_an_entry_carries_a_modification_time_only_where_a_caller_supplied_one() [io]
+    // Nothing in this package invents one, because the standard
+    // library has no call that would answer it.
+    test.case("absent by default")
+    test.assert(not staticmeta.has_modified(an_entry()))
+
+    test.case("and present where the caller said so")
+    test.assert(staticmeta.has_modified(staticmeta.with_modified(an_entry(), t0())))
+
+@test
+fn test_a_media_type_can_be_overridden() [io]
+    test.case("for the file whose extension does not say what it is")
+    let e = staticmeta.with_type(an_entry(), "application/octet-stream")
+    test.assert_eq_str(e.content_type, "application/octet-stream")
+
+@test
+fn test_the_three_cache_presets_are_three_different_promises() [io]
+    test.case("a fingerprinted file: a year, public, immutable")
+    let f = staticmeta.fingerprinted()
+    test.assert(f.max_age == 31536000)
+    test.assert(f.shareable)
+    test.assert(f.immutable)
+    test.assert(str.contains(staticmeta.cache_header(f), "immutable"))
+
+    test.case("a stable name: no-cache, which means store AND revalidate")
+    let r = staticmeta.revalidated()
+    test.assert(not r.immutable)
+    test.assert(str.contains(staticmeta.cache_header(r), "no-cache"))
+
+    test.case("and something a shared cache must not keep")
+    let u = staticmeta.uncached()
+    test.assert(not u.shareable)
+    test.assert(str.contains(staticmeta.cache_header(u), "private"))
+    test.assert(str.contains(staticmeta.cache_header(u), "no-store"))
+
+    test.case("plus a caller's own age")
+    test.assert(staticmeta.cached_for(3600).max_age == 3600)
+
+@test
+fn test_the_fingerprint_heuristic_says_it_is_a_heuristic() [io]
+    // A deployment choosing `fingerprinted()` on the strength of it is
+    // promising `immutable` about a file this function guessed at.
+    test.case("a hash in the middle")
+    test.assert(staticmeta.looks_fingerprinted("site.a1b2c3d4.css"))
+    test.assert(staticmeta.looks_fingerprinted("app-9f8e7d6c.js"))
+
+    test.case("and a plain name is not one")
+    test.assert(not staticmeta.looks_fingerprinted("site.css"))
+    test.assert(not staticmeta.looks_fingerprinted("index.html"))

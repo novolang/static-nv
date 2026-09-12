@@ -1,0 +1,454 @@
+// staticpath.nv — a URL path turned into a path inside a root, or
+// refused.  The load-bearing module of this package, and it performs
+// nothing.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ORDER OF THE TWO STEPS IS THE WHOLE SECURITY ARGUMENT, and it is
+// the opposite of what a reader expects.
+//
+//   1. SPLIT on the literal `/` bytes of the request target.
+//   2. PERCENT-DECODE each segment.
+//   3. CHECK each decoded segment.
+//
+// Decoding before splitting is the bug.  `/files/%2e%2e/%2e%2e/etc/passwd`
+// has no `..` in it as it arrives: a check run first sees `%2e%2e`,
+// passes it, and the decode afterwards produces exactly the traversal
+// the check was for.  So the check runs LAST, on the decoded segment.
+//
+// Splitting after decoding is the other bug, and it is subtler.
+// `/files/a%2Fb` is ONE segment whose name contains a slash — a file
+// called `a/b`, which does not exist on any filesystem this package
+// runs on, because the operating system will read that slash as a
+// separator.  A resolver that decoded first would see two segments and
+// hand back a path one directory deeper than the request named.  So
+// the split runs FIRST, on the literal bytes, and a segment that
+// decodes to something containing a separator is REFUSED rather than
+// accepted or re-split.
+//
+// This is the same argument router-nv makes about matching before
+// decoding, arrived at from the other end.
+//
+// WHAT `[]` BUYS.  Path traversal is the oldest vulnerability a file
+// server has and the reason it keeps happening is that the rules are
+// usually checked against a filesystem: a suite covers the ten inputs
+// somebody thought of, and the eleventh is a CVE.  Nothing in this
+// module touches a disk, so its whole rule set is a table of strings
+// in `staticpath_tests.nv` — every refusal, with the input that
+// triggers it, readable in one screen.  A reviewer auditing this
+// package reads that file.
+//
+// WHAT `[]` CANNOT BUY: SYMLINKS.  A lexical resolver proves that the
+// path it built is inside the root as a STRING.  It cannot know that
+// `root/uploads/x` is a symbolic link to `/etc/shadow`, because
+// finding that out means asking the filesystem.  The standard library
+// answers no symbolic-link question at all — there is no `realpath`,
+// no `readlink`, no link flag on a stat — so `staticfs` cannot perform
+// the second check either, and `staticfs.containment_is_lexical_only`
+// says so out loud rather than letting a deployment assume otherwise.
+// A root that contains no symbolic links is safe; a root that accepts
+// uploads and follows them is not, and the honest interface is the one
+// that says which.
+
+use staticerr
+
+// What a request target resolved to.
+//
+// Five answers, because a static file server genuinely has five —
+// and a resolver that answered `?Str` would collapse the middle three
+// into "no file", which is how a directory ends up 404ing instead of
+// redirecting.
+pub enum StaticResolved
+    // A file inside the root.  The path is RELATIVE to the root and
+    // every segment has been checked, so joining it to the root
+    // cannot leave the root.
+    StaticFile(relative: Str)
+    // A directory with an index file, and the index's relative path.
+    StaticIndex(relative: Str)
+    // A directory with no index file.  The policy decides between a
+    // listing and a 404; the resolver does not, because listing a
+    // directory is a disclosure decision and not a path decision.
+    StaticDirectory(relative: Str)
+    // A directory requested WITHOUT a trailing slash.  The answer is a
+    // 301 to the same path with one — and it is not cosmetic: every
+    // relative link on the page served from `/docs` resolves against
+    // `/`, and the same page served from `/docs/` resolves against
+    // `/docs/`.  A server that skips this redirect serves a page whose
+    // stylesheet and images 404.
+    StaticRedirect(location: Str)
+    // Refused, and why.
+    StaticRefused(reason: staticerr.StaticRefusal)
+
+// What a deployment decides about its own files.
+pub struct StaticPolicy
+    // The index file names, tried in order.  `index.html` alone by
+    // default; a list because a deployment with `index.htm` exists.
+    index_names: [Str]
+    // Whether a directory with no index is listed.  FALSE by default:
+    // a listing publishes every file name in a directory, which is how
+    // a backup file nobody meant to deploy is found.
+    list_directories: Bool
+    // Whether a segment beginning with a dot may be served.  FALSE:
+    // `.git`, `.env` and `.htpasswd` are the three most-scanned paths
+    // on the internet and every one of them is a dotfile.
+    serve_hidden: Bool
+    // Whether a directory without a trailing slash gets a redirect.
+    // TRUE; see `StaticRedirect` for why it is not cosmetic.
+    redirect_directories: Bool
+    // The most segments a path may have.
+    max_segments: Int
+    // The most bytes a path may have.
+    max_bytes: Int
+
+// The conventional policy: `index.html`, no listings, no dotfiles,
+// redirect directories, 32 segments, 1024 bytes.
+//
+// Every one of those defaults is the restrictive choice, and the two
+// that matter are `list_directories` and `serve_hidden` — both false,
+// both the setting a deployment turns on deliberately or not at all.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.defaults().list_directories}")
+// ```
+pub fn defaults() -> StaticPolicy []
+    todo("static-nv.staticpath.defaults")
+
+// The same policy with directory listings on.
+//
+// For a file-drop, a documentation archive, a release directory — the
+// cases where the listing IS the page.  Named rather than a field
+// somebody sets absently, because turning it on publishes every file
+// name in every directory under the root.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.with_listings(staticpath.defaults()).list_directories}")
+// ```
+pub fn with_listings(p: StaticPolicy) -> StaticPolicy []
+    todo("static-nv.staticpath.with_listings")
+
+// The same policy with a different set of index file names.
+//
+// ```novo
+// use std.list
+// use staticpath
+//
+// fn main() [io]
+//     let p = staticpath.with_index_names(staticpath.defaults(), ["index.html", "index.htm"])
+//     println("${list.len(p.index_names)}")
+// ```
+pub fn with_index_names(p: StaticPolicy, names: [Str]) -> StaticPolicy []
+    todo("static-nv.staticpath.with_index_names")
+
+// The same policy serving dotfiles.
+//
+// There is one honest use — a `.well-known` directory, which every
+// ACME certificate renewal needs — and `is_well_known` below is the
+// predicate that admits that one directory without admitting the rest.
+// Reach for this only where the root genuinely holds nothing private,
+// and know that `.git` is a directory a scanner asks for by name on
+// every site it meets.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.with_hidden(staticpath.defaults()).serve_hidden}")
+// ```
+pub fn with_hidden(p: StaticPolicy) -> StaticPolicy []
+    todo("static-nv.staticpath.with_hidden")
+
+// Whether a first segment is the one dotted path that has to work.
+//
+// `.well-known` (RFC 8615) is how an ACME certificate renewal proves
+// control of a domain, and a static file server that refuses every
+// dotted segment refuses it too — which is a certificate that does not
+// renew, three months after anyone was looking.  Published as a
+// predicate so a caller's policy check can admit that one directory
+// without admitting `.git`.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.is_well_known(".well-known")}")
+// ```
+pub fn is_well_known(segment: Str) -> Bool []
+    todo("static-nv.staticpath.is_well_known")
+
+// ── The resolver ─────────────────────────────────────────────────────
+
+// A request target resolved against a root, WITHOUT touching a disk.
+//
+// The `exists` argument is what makes that possible: it is a predicate
+// the caller supplies, answering whether a relative path is a file, a
+// directory, or neither.  `staticfs.resolve` passes one backed by the
+// filesystem; a test passes one backed by a list of strings, which is
+// what lets the entire rule set be asserted with no directory in the
+// room.
+//
+// The steps, in this order:
+//
+//   1. split the target on literal `/` bytes;
+//   2. percent-decode each segment;
+//   3. check each decoded segment against every rule in
+//      `staticerr.StaticRefusal`;
+//   4. ask `exists` about the assembled relative path.
+//
+// Step 2 before step 3 is what catches `%2e%2e`.  Step 1 before step 2
+// is what catches `%2F`.  Both orders are wrong the other way round
+// and both have CVEs behind them.
+//
+// The query string is not stripped here — pass `HttpRequest.path`,
+// which the standard library has already separated.
+//
+// ```novo
+// use staticpath
+//
+// fn kinds(relative: Str) -> Int
+//     if relative == "index.html"
+//         1
+//     else
+//         0
+//
+// fn main() [io]
+//     match staticpath.resolve("/index.html", staticpath.defaults(), kinds)
+//         StaticFile(r)     => println(r)
+//         StaticIndex(r)    => println(r)
+//         StaticDirectory(r) => println(r)
+//         StaticRedirect(l) => println(l)
+//         StaticRefused(_)  => println("refused")
+// ```
+pub fn resolve(target: Str, p: StaticPolicy, exists: fn(Str) -> Int []) -> StaticResolved []
+    todo("static-nv.staticpath.resolve")
+
+// The integer `exists` answers for "not there".
+//
+// The three codes are functions rather than an enum so that the
+// predicate a caller writes is a plain `fn(Str) -> Int` — which is
+// what lets it be a closure over a list in a test and a filesystem
+// call in `staticfs` with no trait in between.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.kind_missing()}")
+// ```
+pub fn kind_missing() -> Int []
+    todo("static-nv.staticpath.kind_missing")
+
+// The integer `exists` answers for a regular file.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.kind_file()}")
+// ```
+pub fn kind_file() -> Int []
+    todo("static-nv.staticpath.kind_file")
+
+// The integer `exists` answers for a directory.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.kind_directory()}")
+// ```
+pub fn kind_directory() -> Int []
+    todo("static-nv.staticpath.kind_directory")
+
+// The resolution alone, with no `exists` question: the checked
+// relative path, or a refusal.
+//
+// For a caller that has its own idea of what a path resolves to — a
+// bundle read out of a zip, an index built at deploy time, a
+// content-addressed store.  Every rule in `staticerr.StaticRefusal`
+// still applies; what is skipped is only the "is it there" half.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     match staticpath.check("/css/site.css", staticpath.defaults())
+//         Ok(r)  => println(r)
+//         Err(_) => println("refused")
+// ```
+pub fn check(target: Str, p: StaticPolicy) -> Result<Str, staticerr.StaticRefusal> []
+    todo("static-nv.staticpath.check")
+
+// A checked relative path joined to a root.
+//
+// The one place the two halves meet, and the only function that
+// produces a filesystem path.  Takes a relative path that `check` or
+// `resolve` produced — nothing else — which is why it is total: every
+// segment of that relative path has already been through every rule.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println(staticpath.join_root("/srv/site", "css/site.css"))
+// ```
+pub fn join_root(root: Str, relative: Str) -> Str []
+    todo("static-nv.staticpath.join_root")
+
+// The relative path a resolution names, or empty for a refusal.
+//
+// ```novo
+// use staticpath
+//
+// fn kinds(relative: Str) -> Int
+//     staticpath.kind_missing()
+//
+// fn main() [io]
+//     let r = staticpath.resolve("/a.txt", staticpath.defaults(), kinds)
+//     println(staticpath.relative_of(r))
+// ```
+pub fn relative_of(r: StaticResolved) -> Str []
+    todo("static-nv.staticpath.relative_of")
+
+// Whether a resolution names something to serve.
+//
+// True for a file and an index; false for a directory, a redirect and
+// a refusal.
+//
+// ```novo
+// use staticpath
+//
+// fn kinds(relative: Str) -> Int
+//     staticpath.kind_missing()
+//
+// fn main() [io]
+//     let r = staticpath.resolve("/a.txt", staticpath.defaults(), kinds)
+//     println("${staticpath.is_servable(r)}")
+// ```
+pub fn is_servable(r: StaticResolved) -> Bool []
+    todo("static-nv.staticpath.is_servable")
+
+// ── The rules, individually ──────────────────────────────────────────
+//
+// Published one by one, because "the resolver is safe" is not a claim
+// a reader can check and "this is what `..` does after decoding" is.
+
+// Every segment of a target, split on literal `/` and percent-decoded,
+// in order.
+//
+// The intermediate value `resolve` checks, exposed so a test can
+// assert the SPLIT and the DECODE separately from the rules — which is
+// what proves the order the module comment argues for.
+//
+// ```novo
+// use std.list
+// use staticpath
+//
+// fn main() [io]
+//     println("${list.len(staticpath.segments("/a/b/c.txt"))}")
+// ```
+pub fn segments(target: Str) -> [Str] []
+    todo("static-nv.staticpath.segments")
+
+// Whether a DECODED segment is one this package will build a path
+// from.
+//
+// `None` when it is.  The whole rule set for one segment, so a reader
+// checking the resolver reads this and its test rather than a
+// paragraph.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     match staticpath.check_segment("..", 0, staticpath.defaults())
+//         Some(_) => println("refused")
+//         None    => println("fine")
+// ```
+pub fn check_segment(decoded: Str, index: Int, p: StaticPolicy) -> ?staticerr.StaticRefusal []
+    todo("static-nv.staticpath.check_segment")
+
+// Whether a decoded segment contains a byte that would act as a path
+// separator on any platform this package runs on: `/` or `\`.
+//
+// The check that makes `%2F` a refusal rather than a decode.  A name
+// containing a separator is a name that reaches out of its directory,
+// and there is no operating system where it means what the request
+// said.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.has_separator("a/b")}")
+// ```
+pub fn has_separator(decoded: Str) -> Bool []
+    todo("static-nv.staticpath.has_separator")
+
+// Whether a decoded segment holds a byte no file name legitimately
+// has: NUL, or anything below 0x20.
+//
+// The NUL half is the one with the history: `/safe.txt%00.jpg`
+// truncating to `/safe.txt` is how an extension allow-list was walked
+// past in half a dozen languages.  The control half is quieter — a
+// newline in a file name is a newline in a log line, and a log a
+// person can be lied to with is a log that is not evidence.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.has_forbidden_byte("ok.txt")}")
+// ```
+pub fn has_forbidden_byte(decoded: Str) -> Bool []
+    todo("static-nv.staticpath.has_forbidden_byte")
+
+// Whether a decoded segment is `.` or `..`.
+//
+// Checked after decoding, which is the half that matters.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.is_dot_segment("..")}")
+// ```
+pub fn is_dot_segment(decoded: Str) -> Bool []
+    todo("static-nv.staticpath.is_dot_segment")
+
+// Whether a decoded segment begins with a dot.
+//
+// `.git`, `.env`, `.htpasswd`, `.DS_Store`, `.svn` — the directory a
+// scanner asks every site for, and the file a framework writes secrets
+// into.  `.well-known` is the one exception and `is_well_known` is how
+// a policy admits it.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println("${staticpath.is_hidden(".env")}")
+// ```
+pub fn is_hidden(decoded: Str) -> Bool []
+    todo("static-nv.staticpath.is_hidden")
+
+// The redirect location for a directory requested without a trailing
+// slash: the same target with one appended, query string preserved.
+//
+// The query has to survive, because a directory link carrying one
+// (`/docs?lang=en`) that loses it on the redirect loses the thing the
+// person asked for.
+//
+// ```novo
+// use staticpath
+//
+// fn main() [io]
+//     println(staticpath.directory_redirect("/docs", "lang=en"))
+// ```
+pub fn directory_redirect(target: Str, query: Str) -> Str []
+    todo("static-nv.staticpath.directory_redirect")

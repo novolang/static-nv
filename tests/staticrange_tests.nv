@@ -1,0 +1,239 @@
+// staticrange_tests.nv — the four ways answering a `Range` goes
+// wrong.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: static-nv.staticrange.<fn>`.
+//
+// A range request is the one place in a static file server where a
+// CLIENT controls arithmetic the SERVER performs.  Every case below is
+// a literal string and a literal size.
+
+use std.test
+use std.list
+use std.str
+use staticerr
+use staticrange
+
+// The first range a header resolves to, or a sentinel that no real
+// range can equal.  `list.get` answers the element and panics out of
+// range, so the length is checked first.
+fn no_range() -> staticrange.StaticRange
+    StaticRange { first: 0 - 1, last: 0 - 1 }
+
+fn one(header: Str, size: Int) -> staticrange.StaticRange
+    match staticrange.parse(header, size, staticrange.default_limits())
+        Err(_) => no_range()
+        Ok(rs) =>
+            if list.len(rs) == 0
+                no_range()
+            else
+                list.get(rs, 0, no_range())
+
+@test
+fn test_a_closed_range_is_inclusive_at_both_ends() [io]
+    // `0-0` is ONE byte.  HTTP's convention, not a programming
+    // language's, and the arithmetic an off-by-one lives in.
+    test.case("one byte")
+    match staticrange.resolve_closed(0, 0, 100)
+        None    => test.assert(false)
+        Some(r) =>
+            test.assert(r.first == 0)
+            test.assert(r.last == 0)
+            test.assert(staticrange.range_len(r) == 1)
+
+    test.case("five hundred bytes")
+    match staticrange.resolve_closed(0, 499, 10000)
+        None    => test.assert(false)
+        Some(r) => test.assert(staticrange.range_len(r) == 500)
+
+@test
+fn test_a_last_byte_past_the_end_is_the_end() [io]
+    // § 14.1.1: a `last-byte-pos` past the end is the end, which is
+    // what lets a client ask for `0-999999` and get the whole file.
+    test.case("clamped")
+    match staticrange.resolve_closed(0, 999999, 100)
+        None    => test.assert(false)
+        Some(r) => test.assert(r.last == 99)
+
+    test.case("but a FIRST byte past the end is unsatisfiable")
+    test.assert_none(staticrange.resolve_closed(100, 200, 100))
+    test.assert_none(staticrange.resolve_closed(101, 200, 100))
+
+@test
+fn test_an_open_range_runs_to_the_end() [io]
+    test.case("from fifty")
+    match staticrange.resolve_open(50, 100)
+        None    => test.assert(false)
+        Some(r) =>
+            test.assert(r.first == 50)
+            test.assert(r.last == 99)
+
+    test.case("and from past the end is unsatisfiable")
+    test.assert_none(staticrange.resolve_open(100, 100))
+
+@test
+fn test_a_suffix_range_is_the_LAST_n_bytes() [io]
+    // Not "from n to the end", which is what `resolve_open` is and
+    // which is the reading that gets implemented by accident.
+    test.case("the last five hundred of ten thousand")
+    match staticrange.resolve_suffix(500, 10000)
+        None    => test.assert(false)
+        Some(r) =>
+            test.assert(r.first == 9500)
+            test.assert(r.last == 9999)
+
+    test.case("a suffix longer than the file is the whole file")
+    match staticrange.resolve_suffix(999999, 100)
+        None    => test.assert(false)
+        Some(r) =>
+            test.assert(r.first == 0)
+            test.assert(r.last == 99)
+
+    test.case("and `-0` is UNSATISFIABLE rather than empty")
+    test.assert_none(staticrange.resolve_suffix(0, 10000))
+
+@test
+fn test_a_zero_length_file_can_answer_no_range_at_all() [io]
+    // The boundary case a parser written from the grammar gets wrong
+    // in both directions: answering an empty 206, or dividing by the
+    // size.
+    test.case("nothing is satisfiable")
+    test.assert(not staticrange.any_satisfiable(0))
+    test.assert(staticrange.any_satisfiable(1))
+
+    test.case("including the open and suffix forms")
+    test.assert_none(staticrange.resolve_open(0, 0))
+    test.assert_none(staticrange.resolve_suffix(1, 0))
+    test.assert_none(staticrange.resolve_closed(0, 0, 0))
+
+@test
+fn test_the_three_forms_parse_from_the_header() [io]
+    test.case("closed")
+    test.assert(one("bytes=0-499", 10000).last == 499)
+
+    test.case("open")
+    test.assert(one("bytes=9500-", 10000).last == 9999)
+
+    test.case("suffix")
+    test.assert(one("bytes=-500", 10000).first == 9500)
+
+@test
+fn test_a_unit_this_package_does_not_know_is_ignored_rather_than_refused() [io]
+    // § 14.2: a recipient that does not understand a range unit MUST
+    // ignore the header — which is a 200 with the whole file, not a
+    // 416.
+    test.case("another unit")
+    test.assert(not staticrange.is_byte_range("items=0-10"))
+    match staticrange.parse("items=0-10", 10000, staticrange.default_limits())
+        Err(_) => test.assert(false)
+        Ok(rs) => test.assert(list.len(rs) == 0)
+
+    test.case("and `bytes` is the one it does know")
+    test.assert(staticrange.is_byte_range("bytes=0-99"))
+
+@test
+fn test_a_range_entirely_outside_the_file_is_a_416_and_not_an_empty_list() [io]
+    // The two look alike and answer differently: an empty list is a
+    // 200 with the whole file, a 416 is a refusal with a header
+    // telling the client how big the file is.
+    test.case("past the end")
+    match staticrange.parse("bytes=20000-30000", 10000, staticrange.default_limits())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(staticerr.status_for(f) == 416)
+
+@test
+fn test_the_416_carries_the_size_so_a_resumed_download_can_correct_itself() [io]
+    test.case("the Content-Range on a 416")
+    test.assert_eq_str(staticrange.unsatisfiable_header(10000), "bytes */10000")
+
+@test
+fn test_a_multi_range_request_is_an_amplifier_and_the_ceiling_is_a_number() [io]
+    // `bytes=0-0,1-1,2-2,…` with ten thousand ranges produces a
+    // multipart response many times the size of the file.
+    test.case("two ranges is fine")
+    match staticrange.parse("bytes=0-9,20-29", 100, staticrange.default_limits())
+        Err(_) => test.assert(false)
+        Ok(rs) => test.assert(list.len(rs) == 2)
+
+    test.case("and the default ceiling is four")
+    test.assert(staticrange.default_limits().max_ranges == 4)
+
+    test.case("past it, the request is refused")
+    match staticrange.parse("bytes=0-0,1-1,2-2,3-3,4-4", 100,
+                            staticrange.default_limits())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a deployment can set its own")
+    test.assert(staticrange.limits(1, 100).max_ranges == 1)
+
+@test
+fn test_overlapping_ranges_are_the_same_amplifier_with_better_manners() [io]
+    // `bytes=0-1000000,0-1000000,0-1000000` is three ranges and three
+    // megabytes from a one-megabyte file.
+    test.case("the total counts overlaps TWICE, because they are sent twice")
+    match staticrange.parse("bytes=0-99,0-99", 1000, staticrange.default_limits())
+        Err(_) => test.assert(false)
+        Ok(rs) => test.assert(staticrange.total_bytes(rs) == 200)
+
+    test.case("and a total past the amplification ceiling is refused")
+    match staticrange.parse("bytes=0-99,0-99,0-99,0-99", 100,
+                            staticrange.default_limits())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_ranges_come_back_in_the_order_they_were_asked_for() [io]
+    // § 14.2 lets a server sort or coalesce; a client that asked for
+    // two ranges expects two parts, in its own order.
+    test.case("out of order stays out of order")
+    match staticrange.parse("bytes=50-59,0-9", 100, staticrange.default_limits())
+        Err(_) => test.assert(false)
+        Ok(rs) =>
+            test.assert(list.len(rs) == 2)
+            test.assert(list.get(rs, 0, no_range()).first == 50)
+
+@test
+fn test_a_single_range_answers_a_content_range_with_the_whole_size() [io]
+    test.case("first, last, and the size a client measures against")
+    let r = StaticRange { first: 0, last: 499 }
+    test.assert_eq_str(staticrange.content_range(r, 10000), "bytes 0-499/10000")
+
+@test
+fn test_accept_ranges_goes_on_every_response_including_the_200s() [io]
+    // A client deciding whether it CAN resume reads this from the
+    // first response, before it has any reason to send a `Range`.  A
+    // server that omits it gets whole-file re-downloads.
+    test.case("the header")
+    test.assert_eq_str(staticrange.accept_ranges(), "bytes")
+
+@test
+fn test_a_multipart_response_is_longer_than_its_parts() [io]
+    // A server that sends the parts' total in `Content-Length` sends a
+    // response the client truncates.
+    test.case("the type carries the boundary")
+    test.assert_eq_str(staticrange.multipart_type("NOVO1234"),
+                       "multipart/byteranges; boundary=NOVO1234")
+
+    test.case("a part header names the boundary, the type and the range")
+    let r = StaticRange { first: 0, last: 9 }
+    let h = staticrange.part_header("NOVO1234", "text/plain", r, 100)
+    test.assert(str.contains(h, "--NOVO1234"))
+    test.assert(str.contains(h, "Content-Type: text/plain"))
+    test.assert(str.contains(h, "bytes 0-9/100"))
+
+    test.case("the close is the boundary with two more dashes")
+    test.assert_eq_str(staticrange.multipart_end("NOVO1234"), "--NOVO1234--\r\n")
+
+    test.case("and the whole length is MORE than the bytes of the parts")
+    match staticrange.parse("bytes=0-9,20-29", 100, staticrange.default_limits())
+        Err(_) => test.assert(false)
+        Ok(rs) =>
+            let total = staticrange.multipart_len(rs, "NOVO1234", "text/plain", 100)
+            test.assert(total > staticrange.total_bytes(rs))
+
+@test
+fn test_a_refused_range_is_a_fault_a_caller_can_act_on() [io]
+    test.case("too many ranges is not the same as unsatisfiable")
+    test.assert(staticerr.status_for(staticerr.StaticRangeRefused("too many")) != 416)
+    test.assert(staticerr.status_for(staticerr.StaticRangeUnsatisfiable(9, 4)) == 416)

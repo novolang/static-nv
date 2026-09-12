@@ -1,0 +1,193 @@
+// staticerr.nv — the refusals, and the status each one deserves.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A REFUSED PATH IS NOT A FAILURE, AND THAT IS WHY IT IS NOT AN ERROR
+// TYPE.  `staticpath.resolve` answers a `StaticResolved`, one variant
+// of which carries a `StaticRefusal`; nothing about it is a `Result`,
+// because a request for `/../../etc/passwd` is not a malfunction of
+// this library, it is an ANSWER — a 404 — and modelling it as an error
+// would put the ordinary case of somebody probing a server on the
+// failure path.
+//
+// `StaticFault` below is for the things that ARE failures: a disk that
+// would not read, a root that is not there, a range this package
+// cannot answer.
+//
+// EVERY REFUSAL ANSWERS 404 AND NOT 403.  This is a decision, and it
+// is the one to argue about.  A 403 tells a prober that the path
+// exists and they are not allowed it; a 404 tells them nothing.  For a
+// static file server there is no legitimate client that benefits from
+// the distinction — a browser following a link never sends `..` — so
+// every refusal is a 404 and the DETAIL goes in the log, where the
+// operator can see the difference between a scanner and a broken
+// relative link.
+
+// Why a path was refused.
+//
+// One variant per rule `staticpath.resolve` applies, so a log can say
+// which and a test can assert which.  They are all 404s to the client.
+pub enum StaticRefusal
+    // A segment that decodes to `..`.  Checked AFTER percent-decoding,
+    // which is the half that matters: `%2e%2e` is `..` and a resolver
+    // that checked first would let it through.
+    StaticTraversal(at_segment: Int)
+    // A segment carrying a percent-encoded separator — `%2F` or `%5C`.
+    // REFUSED rather than decoded: a decoded slash is a separator the
+    // path did not contain, and a name holding one is a name that
+    // reaches out of its directory.
+    StaticEncodedSeparator(at_segment: Int)
+    // A NUL byte, encoded or otherwise.  A path truncated at a NUL is
+    // how `/safe.txt%00.jpg` became `/safe.txt` in a dozen languages.
+    StaticNulByte(at_segment: Int)
+    // A control byte, a newline, or anything else below 0x20.  Nothing
+    // legitimate has one in a file name and a log line with a newline
+    // in it is a log a person can be lied to with.
+    StaticControlByte(at_segment: Int, byte: Int)
+    // A backslash.  A separator on one operating system and an
+    // ordinary character on another, which means a resolver that
+    // allowed it answers differently by platform — and the platform
+    // where it is a separator is the one where it escapes.
+    StaticBackslash(at_segment: Int)
+    // A segment beginning with a dot.  `.git`, `.env`, `.htpasswd`:
+    // the files a deployment did not mean to publish and puts in the
+    // root by accident.  Refused by default; `StaticPolicy` is where a
+    // deployment says otherwise.
+    StaticHiddenSegment(at_segment: Int)
+    // More segments than the policy allows.  A path with four thousand
+    // segments is not a request, and resolving one is work an attacker
+    // chose the size of.
+    StaticTooDeep(segments: Int, ceiling: Int)
+    // Longer than the policy allows, in bytes.
+    StaticTooLong(bytes: Int, ceiling: Int)
+    // A path that did not begin with `/`.  Not an attack — a caller
+    // passing something other than a request target — and named
+    // separately so it is not confused with one.
+    StaticNotRooted
+
+// The things that are actually failures.
+pub enum StaticFault
+    // The root directory is not there, or could not be read.  A
+    // deployment fault: every request will fail the same way.
+    StaticRootUnreadable(root: Str, detail: Str)
+    // A file that resolved, exists, and would not read.
+    StaticFileUnreadable(path: Str, detail: Str)
+    // A `Range` header this package will not answer: too many ranges,
+    // or ranges whose total exceeds the whole file.  RFC 9110 § 14.2
+    // permits a server to refuse, and it is worth refusing — a request
+    // for ten thousand one-byte ranges is a multipart response
+    // thousands of times the size of the file.
+    StaticRangeRefused(detail: Str)
+    // A `Range` naming bytes outside the file.  RFC 9110 § 14.4's 416,
+    // which is a real answer with a real header rather than a 404.
+    StaticRangeUnsatisfiable(first: Int, size: Int)
+    // A directory was requested, there is no index file, and the
+    // policy does not list directories.
+    StaticNoIndex(path: Str)
+
+// The standard `Error` implementation, so a failed read is reported by
+// anything that reports errors.
+impl Error for StaticFault
+    // One line: what was being served and what stopped it.
+    fn message(self) -> Str
+        todo("static-nv.staticerr.StaticFault.message")
+
+// The status a refusal answers: 404, every one of them.
+//
+// Published as a function rather than a constant so the decision has
+// somewhere to be argued, and so a deployment that genuinely wants
+// 403 for hidden files can see exactly what it is changing.
+//
+// ```novo
+// use staticerr
+//
+// fn main() [io]
+//     println("${staticerr.refusal_status(staticerr.StaticNotRooted)}")
+// ```
+pub fn refusal_status(r: StaticRefusal) -> Int []
+    todo("static-nv.staticerr.refusal_status")
+
+// The status a fault answers.
+//
+// 500 for an unreadable file, 503 for an unreadable root, 416 for an
+// unsatisfiable range, 404 for a directory with no index.  Published
+// because two handlers deciding this separately will disagree, and a
+// 500 for a missing index page is a monitoring alert for a link
+// somebody typed wrongly.
+//
+// ```novo
+// use staticerr
+//
+// fn main() [io]
+//     println("${staticerr.status_for(staticerr.StaticRangeUnsatisfiable(9, 4))}")
+// ```
+pub fn status_for(f: StaticFault) -> Int []
+    todo("static-nv.staticerr.status_for")
+
+// A one-line description of a refusal, for a log.
+//
+// The half a client never sees.  It is what tells an operator the
+// difference between a scanner walking `..` and a stylesheet with a
+// relative link one directory too high — which look identical from
+// the 404 count alone.
+//
+// ```novo
+// use staticerr
+//
+// fn main() [io]
+//     println(staticerr.refusal_detail(staticerr.StaticTraversal(2)))
+// ```
+pub fn refusal_detail(r: StaticRefusal) -> Str []
+    todo("static-nv.staticerr.refusal_detail")
+
+// Whether a refusal looks like somebody probing rather than a broken
+// link.
+//
+// True for traversal, encoded separators, NUL and control bytes —
+// none of which a browser following a link ever produces.  False for a
+// hidden segment and for the two ceilings, which a badly generated
+// site produces by accident.
+//
+// The number to graph: a deployment whose probe count is flat has a
+// broken link, and one whose probe count spikes has a visitor.
+//
+// ```novo
+// use staticerr
+//
+// fn main() [io]
+//     println("${staticerr.looks_like_probing(staticerr.StaticTraversal(1))}")
+// ```
+pub fn looks_like_probing(r: StaticRefusal) -> Bool []
+    todo("static-nv.staticerr.looks_like_probing")
+
+// Whether a fault is the deployment's rather than the request's.
+//
+// True for an unreadable root: every request will fail identically
+// until somebody fixes it, which is a different alert from a file that
+// went missing.
+//
+// ```novo
+// use staticerr
+//
+// fn main() [io]
+//     let f = staticerr.StaticRootUnreadable("/srv/site", "no such directory")
+//     println("${staticerr.is_configuration_fault(f)}")
+// ```
+pub fn is_configuration_fault(f: StaticFault) -> Bool []
+    todo("static-nv.staticerr.is_configuration_fault")
+
+// Every refusal this package can answer, as strings a person can read.
+//
+// The list IS the contract: a reader auditing the resolver's rules
+// reads it, a deployment prints it in a diagnostic, and adding to it
+// is a minor bump.
+//
+// ```novo
+// use std.list
+// use staticerr
+//
+// fn main() [io]
+//     println("${list.len(staticerr.refusal_names())}")
+// ```
+pub fn refusal_names() -> [Str] []
+    todo("static-nv.staticerr.refusal_names")

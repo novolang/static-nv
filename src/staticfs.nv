@@ -1,0 +1,461 @@
+// staticfs.nv — the half that reads a disk.  `[fs]`, and nothing else.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[fs]` AND NOT `[io]`.  A library does not print, so nothing here
+// writes a line; and not `[net]`, because this package answers a
+// VALUE and the caller's server writes it to a socket.  That keeps a
+// deployment's own row honest: mounting static files costs the
+// filesystem and nothing more.
+//
+// TWO WAYS TO USE IT, AND THE FIRST IS THE ONE TO USE.
+//
+//   · `scan` walks the root ONCE at start-up and builds an index:
+//     every file's size, its content hash, its media type, and which
+//     precompressed siblings exist.  Every request after that is a
+//     lookup plus one positional read of the bytes actually asked for.
+//     That is what whitenoise does and it is why it is fast.
+//
+//   · `stat_one` and `read_range` are the same operations per request,
+//     for a root that changes while the server runs.  Correct, and
+//     three or four filesystem calls per request instead of one.
+//
+// The index is also what makes the content-hash ETag affordable: the
+// hash is computed once per file at start-up rather than once per
+// request.  See `staticmeta`'s note on why there is no cheaper
+// validator available.
+//
+// CONTAINMENT IS LEXICAL, AND THIS PACKAGE SAYS SO RATHER THAN
+// PRETENDING.  `staticpath` proves that the path it built is inside
+// the root AS A STRING — every segment checked, no traversal, no
+// encoded separator.  It cannot prove that `root/uploads/x` is not a
+// symbolic link to `/etc/shadow`, because that question is the
+// filesystem's, and **the standard library answers no symbolic-link
+// question at all**: no `realpath`, no `readlink`, no link flag on any
+// metadata call.  So `staticfs` cannot run the second check either.
+//
+// `containment_is_lexical_only` is published for exactly this, and it
+// answers `true` today.  A root a deployment controls end to end is
+// safe; a root that accepts uploads and follows links is not.  The gap
+// is filed against the standard library rather than papered over, and
+// the day a `realpath` lands this function's answer changes and
+// nothing else in the surface does.
+
+use civil
+use staticenc
+use staticerr
+use staticmeta
+use staticpath
+use staticrange
+
+// Where a root is, and what a deployment decided about it.
+pub struct StaticRoot
+    // The directory served from.  Absolute, by convention: a relative
+    // root resolves against the process's working directory, which a
+    // service manager may change under the program.
+    path: Str
+    // The path rules.
+    policy: staticpath.StaticPolicy
+    // The range limits.
+    ranges: staticrange.StaticRangeLimits
+    // Whether precompressed siblings are looked for.
+    negotiate_encoding: Bool
+
+// An index of everything under a root.
+//
+// Built by `scan`, held by the caller for the life of the process, and
+// consulted per request instead of the filesystem.
+pub struct StaticIndex
+    // The root this index is of.
+    root: StaticRoot
+    // One entry per file.
+    entries: [staticmeta.StaticEntry]
+    // What compressed siblings exist, one per entry, in the same
+    // order.
+    encodings: [staticenc.StaticEncodings]
+    // When the scan ran.  This is what `Last-Modified` is emitted from
+    // when a caller asks for it: not each file's own modification time
+    // — the standard library has no such call — but the moment the
+    // deployment read them.  Honest, coarse, and enough to make a
+    // conditional request work within one deploy.
+    scanned_at: ?civil.CivilDateTime
+
+// Everything a response needs, as a value the caller writes.
+//
+// This package builds no `HttpResponse`: it answers what to send, and
+// the caller's server — the standard library's, or another — turns it
+// into bytes.  That is what keeps the package free of `[net]` and what
+// lets the same value serve a test that asserts headers.
+pub struct StaticServed
+    // The status: 200, 206, 304, 404, 406, 412, 416, or 301.
+    status: Int
+    // The headers, in the order they should be written.
+    headers: [(Str, Str)]
+    // The bytes, empty for a 304, a 301 and a HEAD.
+    body: Bytes
+    // The entry that was served, where one was.
+    relative: Str
+
+// A root with the conventional policy and limits.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io]
+//     println(staticfs.root("/srv/site").path)
+// ```
+pub fn root(path: Str) -> StaticRoot []
+    todo("static-nv.staticfs.root")
+
+// The same root with a path policy the caller chose.
+//
+// ```novo
+// use staticfs
+// use staticpath
+//
+// fn main() [io]
+//     let r = staticfs.with_policy(staticfs.root("/srv/site"),
+//                                  staticpath.with_listings(staticpath.defaults()))
+//     println("${r.policy.list_directories}")
+// ```
+pub fn with_policy(r: StaticRoot, p: staticpath.StaticPolicy) -> StaticRoot []
+    todo("static-nv.staticfs.with_policy")
+
+// The same root with range limits the caller chose.
+//
+// ```novo
+// use staticfs
+// use staticrange
+//
+// fn main() [io]
+//     let r = staticfs.with_ranges(staticfs.root("/srv/site"), staticrange.limits(1, 100))
+//     println("${r.ranges.max_ranges}")
+// ```
+pub fn with_ranges(r: StaticRoot, lim: staticrange.StaticRangeLimits) -> StaticRoot []
+    todo("static-nv.staticfs.with_ranges")
+
+// The same root, ignoring precompressed siblings.
+//
+// For a root where the build wrote none, so no request pays for the
+// two `exists` calls that look for them.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io]
+//     println("${staticfs.without_encoding(staticfs.root("/srv/site")).negotiate_encoding}")
+// ```
+pub fn without_encoding(r: StaticRoot) -> StaticRoot []
+    todo("static-nv.staticfs.without_encoding")
+
+// ── The index ────────────────────────────────────────────────────────
+
+// Walk a root and build an index: every file's size, hash, media type
+// and siblings.
+//
+// Called once, at start-up.  On a site of a few thousand files this
+// reads every byte once — which is what makes the content-hash ETag
+// affordable, because the alternative is hashing per request.
+//
+// `scanned_at` is left absent; `scan_at` is the twin that stamps it.
+//
+// Refuses a root that is not a readable directory, which is a
+// deployment fault and should stop the program rather than produce a
+// server that 404s everything.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io, fs]
+//     match staticfs.scan(staticfs.root("/srv/site"))
+//         Ok(ix) => println("${staticfs.index_len(ix)}")
+//         Err(_) => println("that root is not readable")
+// ```
+pub fn scan(r: StaticRoot) -> Result<StaticIndex, staticerr.StaticFault> [fs]
+    todo("static-nv.staticfs.scan")
+
+// The same scan, stamped with the time the caller read from a clock.
+//
+// The stamp is what `Last-Modified` is emitted from.  A parameter
+// rather than a clock read here, so this function stays `[fs]` and so
+// a test can pin the header.
+//
+// ```novo
+// use civil
+// use staticfs
+//
+// fn main() [io, fs]
+//     let at = civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+//     match staticfs.scan_at(staticfs.root("/srv/site"), at)
+//         Ok(ix) => println("${staticfs.index_len(ix)}")
+//         Err(_) => println("that root is not readable")
+// ```
+pub fn scan_at(r: StaticRoot,
+               at: civil.CivilDateTime) -> Result<StaticIndex, staticerr.StaticFault> [fs]
+    todo("static-nv.staticfs.scan_at")
+
+// How many files an index holds.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io, fs]
+//     match staticfs.scan(staticfs.root("/srv/site"))
+//         Err(_) => println("no")
+//         Ok(ix) => println("${staticfs.index_len(ix)}")
+// ```
+pub fn index_len(ix: StaticIndex) -> Int []
+    todo("static-nv.staticfs.index_len")
+
+// The entry for a relative path, or `None`.
+//
+// `[]`: a lookup in a value the caller already holds, which is what
+// makes an indexed deployment answer most requests without a
+// filesystem call.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io, fs]
+//     match staticfs.scan(staticfs.root("/srv/site"))
+//         Err(_) => println("no")
+//         Ok(ix) =>
+//             match staticfs.lookup(ix, "index.html")
+//                 Some(e) => println("${e.size}")
+//                 None    => println("not in the index")
+// ```
+pub fn lookup(ix: StaticIndex, relative: Str) -> ?staticmeta.StaticEntry []
+    todo("static-nv.staticfs.lookup")
+
+// The compressed siblings an index found for a relative path.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io, fs]
+//     match staticfs.scan(staticfs.root("/srv/site"))
+//         Err(_) => println("no")
+//         Ok(ix) => println("${staticfs.encodings_of(ix, "index.html").has_gzip}")
+// ```
+pub fn encodings_of(ix: StaticIndex, relative: Str) -> staticenc.StaticEncodings []
+    todo("static-nv.staticfs.encodings_of")
+
+// Every relative path in an index, sorted.
+//
+// For a deployment that wants to log what it is serving, or to
+// generate a sitemap from the same walk.
+//
+// ```novo
+// use std.list
+// use staticfs
+//
+// fn main() [io, fs]
+//     match staticfs.scan(staticfs.root("/srv/site"))
+//         Err(_) => println("no")
+//         Ok(ix) => println("${list.len(staticfs.index_paths(ix))}")
+// ```
+pub fn index_paths(ix: StaticIndex) -> [Str] []
+    todo("static-nv.staticfs.index_paths")
+
+// ── Per-request filesystem access ────────────────────────────────────
+
+// What a relative path is on disk: missing, a file, or a directory.
+//
+// The predicate `staticpath.resolve` takes, backed by the filesystem.
+// Answers one of `staticpath.kind_missing`, `kind_file`,
+// `kind_directory`.
+//
+// ```novo
+// use staticfs
+// use staticpath
+//
+// fn main() [io, fs]
+//     let k = staticfs.kind_of(staticfs.root("/srv/site"), "index.html")
+//     println("${k == staticpath.kind_file()}")
+// ```
+pub fn kind_of(r: StaticRoot, relative: Str) -> Int [fs]
+    todo("static-nv.staticfs.kind_of")
+
+// One file's entry, read from the filesystem now.
+//
+// The unindexed path: a size call and a full read to hash the content.
+// Correct for a root that changes while the server runs, and the
+// reason `scan` exists for the roots that do not.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io, fs]
+//     match staticfs.stat_one(staticfs.root("/srv/site"), "index.html")
+//         Ok(e)  => println("${e.size}")
+//         Err(_) => println("not readable")
+// ```
+pub fn stat_one(r: StaticRoot,
+                relative: Str) -> Result<staticmeta.StaticEntry, staticerr.StaticFault> [fs]
+    todo("static-nv.staticfs.stat_one")
+
+// Which precompressed siblings exist beside a file, asked now.
+//
+// Two `exists` calls where both are enabled — which is why
+// `without_encoding` is worth setting on a root whose build wrote
+// none.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io, fs]
+//     println("${staticfs.siblings_of(staticfs.root("/srv/site"), "a.css").has_gzip}")
+// ```
+pub fn siblings_of(r: StaticRoot, relative: Str) -> staticenc.StaticEncodings [fs]
+    todo("static-nv.staticfs.siblings_of")
+
+// A byte range of a file.
+//
+// A positional read, so serving the last megabyte of a gigabyte file
+// reads a megabyte.  The alternative — reading the file and slicing —
+// is what makes a video server fall over, and it is what the standard
+// library's own static handler does today.
+//
+// ```novo
+// use staticfs
+// use staticrange
+// use std.bytes
+//
+// fn main() [io, fs]
+//     let r = StaticRange { first: 0, last: 99 }
+//     match staticfs.read_range(staticfs.root("/srv/site"), "big.mp4", r)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(_) => println("not readable")
+// ```
+pub fn read_range(r: StaticRoot, relative: Str,
+                  span: staticrange.StaticRange) -> Result<Bytes, staticerr.StaticFault> [fs]
+    todo("static-nv.staticfs.read_range")
+
+// A whole file.
+//
+// ```novo
+// use staticfs
+// use std.bytes
+//
+// fn main() [io, fs]
+//     match staticfs.read_all(staticfs.root("/srv/site"), "index.html")
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(_) => println("not readable")
+// ```
+pub fn read_all(r: StaticRoot, relative: Str) -> Result<Bytes, staticerr.StaticFault> [fs]
+    todo("static-nv.staticfs.read_all")
+
+// The entries of a directory, for a listing.
+//
+// Sorted, directories first.  Only reached where the policy says
+// `list_directories`; a root whose policy does not is never walked.
+//
+// ```novo
+// use std.list
+// use staticfs
+//
+// fn main() [io, fs]
+//     match staticfs.list_dir(staticfs.root("/srv/site"), "docs")
+//         Ok(names) => println("${list.len(names)}")
+//         Err(_)    => println("not a directory")
+// ```
+pub fn list_dir(r: StaticRoot, relative: Str) -> Result<[Str], staticerr.StaticFault> [fs]
+    todo("static-nv.staticfs.list_dir")
+
+// ── Serving ──────────────────────────────────────────────────────────
+
+// A whole request answered from an index: the status, the headers and
+// the bytes.
+//
+// The one call a mounted handler makes.  In order: resolve the path,
+// look the entry up, evaluate the conditional headers, choose an
+// encoding, parse the `Range`, read what is needed, and assemble the
+// headers.  `[fs]`, because the last of those reads.
+//
+// `header` is a lookup answering a request header by name, empty where
+// absent — the same shape `staticmeta.conditions_of` takes — so this
+// package depends on nobody's request type and a test drives it from a
+// list.
+//
+// `is_head` suppresses the body and nothing else: a HEAD answers
+// exactly the headers its GET would, including `Content-Length`, which
+// is the whole reason a client sends one.
+//
+// ```novo
+// use staticfs
+//
+// fn no_headers(name: Str) -> Str
+//     ""
+//
+// fn main() [io, fs]
+//     match staticfs.scan(staticfs.root("/srv/site"))
+//         Err(_) => println("no root")
+//         Ok(ix) =>
+//             match staticfs.serve(ix, "/index.html", "", no_headers, false)
+//                 Ok(s)  => println("${s.status}")
+//                 Err(_) => println("not served")
+// ```
+pub fn serve(ix: StaticIndex, target: Str, query: Str, header: fn(Str) -> Str [],
+             is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    todo("static-nv.staticfs.serve")
+
+// The same, without an index: every metadata question asked now.
+//
+// For a root that changes while the server runs.
+//
+// ```novo
+// use staticfs
+//
+// fn no_headers(name: Str) -> Str
+//     ""
+//
+// fn main() [io, fs]
+//     match staticfs.serve_live(staticfs.root("/srv/site"), "/index.html", "",
+//                               no_headers, false)
+//         Ok(s)  => println("${s.status}")
+//         Err(_) => println("not served")
+// ```
+pub fn serve_live(r: StaticRoot, target: Str, query: Str, header: fn(Str) -> Str [],
+                  is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    todo("static-nv.staticfs.serve_live")
+
+// A header from a served response, or empty.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io]
+//     let s = StaticServed { status: 200, headers: [("ETag", "\"a\"")],
+//                            body: bytes.from_byte_list([]), relative: "a" }
+//     println(staticfs.served_header(s, "ETag"))
+// ```
+pub fn served_header(s: StaticServed, name: Str) -> Str []
+    todo("static-nv.staticfs.served_header")
+
+// Whether containment against this root is only lexical.
+//
+// **`true` today**, and the reason is named rather than hidden: the
+// standard library answers no symbolic-link question — no `realpath`,
+// no `readlink`, no link flag on any metadata call — so neither
+// `staticpath` nor this module can prove that a resolved path stays
+// inside the root once a symbolic link is in the way.  What IS proved
+// is that the path is inside the root as a string: every segment
+// checked, no traversal, no encoded separator, no NUL.
+//
+// A root a deployment wrote itself is safe.  A root that accepts
+// uploads, or that a person can put links in, is not — and a
+// deployment in that position should hold its files somewhere a
+// symbolic link cannot be created.
+//
+// Published as a function so a deployment's own audit asserts it, and
+// so the day a `realpath` lands the answer changes here and nowhere
+// else.
+//
+// ```novo
+// use staticfs
+//
+// fn main() [io]
+//     println("${staticfs.containment_is_lexical_only()}")
+// ```
+pub fn containment_is_lexical_only() -> Bool []
+    todo("static-nv.staticfs.containment_is_lexical_only")

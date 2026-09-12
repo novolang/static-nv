@@ -1,0 +1,85 @@
+[package]
+name        = "static-nv"
+version     = "0.0.1"
+description = "Static files over HTTP: a path resolver that cannot escape its root and performs nothing while proving it, ETags and conditional requests, byte ranges, precompressed siblings, and cache-control presets.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and the split inside it is the security argument.
+#
+# FIVE OF THE SIX MODULES ARE `[]`.  `staticerr`, `staticpath`,
+# `staticmeta`, `staticrange` and `staticenc` touch nothing: a path is
+# resolved by arithmetic over a string, a conditional request is
+# answered by comparing two strings, a `Range` header is parsed into
+# integers, and an `Accept-Encoding` is a list of tokens with weights.
+#
+# That matters most for `staticpath`.  Path traversal is the oldest
+# vulnerability a file server has, and the way it survives is that the
+# rules are checked against a filesystem — so a suite covers the ten
+# inputs somebody thought of and the eleventh is a CVE.  Here the
+# resolver is `[]`, so its entire rule set is a table of strings in
+# `staticpath_tests.nv` with no directory in the room, and a reader can
+# audit the rules by reading the test.
+#
+# `staticfs` is the half that reads.  `[fs]` and nothing else: no
+# `[io]`, because a library does not print, and no `[net]`, because
+# writing the response is the caller's server's job and this package
+# hands back a value.
+layer       = "host"
+
+category    = "web"
+
+tags        = ["static", "http", "file-server", "etag", "range-requests", "cache-control", "tower-http", "whitenoise"]
+repository  = "https://github.com/novolang/static-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A resolver that proves containment without touching a disk"
+
+# ── The dependencies, and two deliberate absences ────────────────────
+
+[dependencies]
+# calendar-nv is the HTTP-date arithmetic.  `Last-Modified` and
+# `If-Modified-Since` are RFC 9110 § 5.6.7's IMF-fixdate, which is one
+# format to write and THREE to accept — and a conditional request whose
+# date this package cannot read is a 200 with a whole file in it where
+# a 304 would do.
+calendar-nv = "^0.0.2"
+
+# crypto-nv is `hashing.sha256`, which is what a strong `ETag` is here.
+# The reason it is a content hash rather than size-and-mtime is in the
+# README: the standard library answers no modification time, so
+# size-and-mtime is not a validator this package could compute even if
+# it wanted one.  `digest.ct_eq` is not used — an ETag comparison is
+# not a secret comparison.
+crypto-nv   = "^0.1.1"
+
+# mime-nv is `Content-Type`, and the reason it is not `path.ext` plus a
+# table is `mimesniff.sniff_with`: a `.txt` whose first bytes are a
+# doctype, served as `text/plain`, RUNS AS HTML on the serving origin
+# unless `X-Content-Type-Options: nosniff` is set.  A static file
+# server is the one program that can and should set that header, and
+# mime-nv is where the rule about when it matters lives.
+mime-nv     = "^0.0.1"
+
+# NOT flate-nv and NOT brotli-nv, and the absence is the design.  This
+# package does not compress: it SERVES a `.gz` or `.br` sibling the
+# build already produced, as bytes, with `Content-Encoding` set.
+# Compressing per request is the wrong place — the same file is
+# compressed once per requester rather than once per deploy — and
+# depending on two codecs to move bytes a build already moved would
+# make every deployment link them.
+#
+# NOT http-codec-nv.  `Range`, `If-None-Match`, `If-Modified-Since` and
+# `Accept-Encoding` have no parser there, so they are parsed here.  See
+# the README: a second consumer would move them.
