@@ -5,6 +5,10 @@ All notable changes to static-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-12
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -67,3 +71,24 @@ The **interface**: every signature and every effect row, and no bodies.
   is nothing truthful to put in the header by default.
 - No `tests/embedded_probe.nv`: this is a `host` package, so it makes
   no device claim to check.
+
+### Design notes
+
+`Range`, `If-None-Match`, `If-Modified-Since` and `Accept-Encoding` are
+parsed here because nothing else on the registry parses them.
+http-codec-nv reads a request line, the header fields as name-value
+pairs and the body's framing, and stops. mime-nv parses `Accept` and
+cannot parse `Accept-Encoding`: RFC 9110 section 12.5.3's grammar is a
+list of codings with quality values where section 12.5.1's is a list of
+media ranges with them, and `gzip` has no `/` in it. A second consumer,
+such as a caching proxy or a client that revalidates its own cache,
+would be the reason to move those four into a shared package.
+
+Adopting this in `orbit/website` would replace the standard library's
+thirteen-line handler: `staticfs.scan` at start-up and `staticfs.serve`
+per request would give the documentation pages 304s instead of full
+re-downloads, serve the `.gz` files the generator can already write,
+and read a byte range of the wasm blob rather than all of it. The
+choice to make first is the cache policy: fingerprinted assets want
+`staticmeta.fingerprinted` and HTML pages want
+`staticmeta.revalidated`.

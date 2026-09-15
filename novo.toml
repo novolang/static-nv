@@ -1,6 +1,6 @@
 [package]
 name        = "static-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Static files over HTTP: a path resolver that cannot escape its root and performs nothing while proving it, ETags and conditional requests, byte ranges, precompressed siblings, and cache-control presets.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
