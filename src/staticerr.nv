@@ -2,13 +2,16 @@
 //
 // Every body here is a `todo()`; the signatures are the design.
 //
-// A REFUSED PATH IS NOT A FAILURE, AND THAT IS WHY IT IS NOT AN ERROR
-// TYPE.  `staticpath.resolve` answers a `StaticResolved`, one variant
-// of which carries a `StaticRefusal`; nothing about it is a `Result`,
+// A REFUSED PATH IS NOT A FAILURE, AND THAT IS WHY `resolve` DOES NOT
+// REPORT ONE.  `staticpath.resolve` answers a `StaticResolved`, one
+// variant of which carries a `StaticRefusal`, rather than a `Result`,
 // because a request for `/../../etc/passwd` is not a malfunction of
 // this library, it is an ANSWER — a 404 — and modelling it as an error
 // would put the ordinary case of somebody probing a server on the
-// failure path.
+// failure path.  `staticpath.check` — the resolution alone, for a
+// caller with its own idea of what a path resolves to — does answer a
+// `Result`, and so `StaticRefusal` implements `Error`: SPEC § 3.4
+// requires that of every error type a `Result` names.
 //
 // `StaticFault` below is for the things that ARE failures: a disk that
 // would not read, a root that is not there, a range this package
@@ -84,6 +87,16 @@ pub enum StaticFault
     // A directory was requested, there is no index file, and the
     // policy does not list directories.
     StaticNoIndex(path: Str)
+
+// The standard `Error` implementation, for `staticpath.check`, which
+// answers a `Result` over a refusal.  A refusal is still an answer and
+// not a failure — see the note at the head of this file — and this is
+// the bound SPEC § 3.4 puts on a `Result`'s error type, nothing more.
+impl Error for StaticRefusal
+    // One line: which rule refused the path, and where.  The same
+    // wording as `refusal_detail`.
+    fn message(self) -> Str
+        todo("static-nv.staticerr.StaticRefusal.message")
 
 // The standard `Error` implementation, so a failed read is reported by
 // anything that reports errors.
