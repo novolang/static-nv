@@ -1,7 +1,5 @@
 // staticerr.nv — the refusals, and the status each one deserves.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A REFUSED PATH IS NOT A FAILURE, AND THAT IS WHY `resolve` DOES NOT
 // REPORT ONE.  `staticpath.resolve` answers a `StaticResolved`, one
 // variant of which carries a `StaticRefusal`, rather than a `Result`,
@@ -96,14 +94,19 @@ impl Error for StaticRefusal
     // One line: which rule refused the path, and where.  The same
     // wording as `refusal_detail`.
     fn message(self) -> Str
-        todo("static-nv.staticerr.StaticRefusal.message")
+        refusal_detail(self)
 
 // The standard `Error` implementation, so a failed read is reported by
 // anything that reports errors.
 impl Error for StaticFault
     // One line: what was being served and what stopped it.
     fn message(self) -> Str
-        todo("static-nv.staticerr.StaticFault.message")
+        match self
+            StaticRootUnreadable(root, detail)    => "root ${root}: ${detail}"
+            StaticFileUnreadable(path, detail)    => "file ${path}: ${detail}"
+            StaticRangeRefused(detail)            => "range refused: ${detail}"
+            StaticRangeUnsatisfiable(first, size) => "byte ${first} is past the end of a ${size}-byte file"
+            StaticNoIndex(path)                   => "no index in ${path}"
 
 // The status a refusal answers: 404, every one of them.
 //
@@ -118,7 +121,8 @@ impl Error for StaticFault
 //     println("${staticerr.refusal_status(staticerr.StaticNotRooted)}")
 // ```
 pub fn refusal_status(r: StaticRefusal) -> Int []
-    todo("static-nv.staticerr.refusal_status")
+    match r
+        _ => 404
 
 // The status a fault answers.
 //
@@ -135,7 +139,14 @@ pub fn refusal_status(r: StaticRefusal) -> Int []
 //     println("${staticerr.status_for(staticerr.StaticRangeUnsatisfiable(9, 4))}")
 // ```
 pub fn status_for(f: StaticFault) -> Int []
-    todo("static-nv.staticerr.status_for")
+    match f
+        StaticRootUnreadable(_, _)     => 503
+        StaticFileUnreadable(_, _)     => 500
+        // A refused range is not an unsatisfiable one: the whole file
+        // is sent instead, which is what a 200 says.
+        StaticRangeRefused(_)          => 200
+        StaticRangeUnsatisfiable(_, _) => 416
+        StaticNoIndex(_)               => 404
 
 // A one-line description of a refusal, for a log.
 //
@@ -151,7 +162,16 @@ pub fn status_for(f: StaticFault) -> Int []
 //     println(staticerr.refusal_detail(staticerr.StaticTraversal(2)))
 // ```
 pub fn refusal_detail(r: StaticRefusal) -> Str []
-    todo("static-nv.staticerr.refusal_detail")
+    match r
+        StaticTraversal(at)        => "segment ${at} is a dot segment after decoding"
+        StaticEncodedSeparator(at) => "segment ${at} holds a slash after decoding"
+        StaticNulByte(at)          => "segment ${at} holds a NUL byte"
+        StaticControlByte(at, b)   => "segment ${at} holds control byte ${b}"
+        StaticBackslash(at)        => "segment ${at} holds a backslash"
+        StaticHiddenSegment(at)    => "segment ${at} is a dotfile"
+        StaticTooDeep(n, ceiling)  => "the path has ${n} segments, the ceiling is ${ceiling}"
+        StaticTooLong(n, ceiling)  => "the path is ${n} bytes, the ceiling is ${ceiling}"
+        StaticNotRooted            => "the target does not begin with a slash"
 
 // Whether a refusal looks like somebody probing rather than a broken
 // link.
@@ -171,7 +191,18 @@ pub fn refusal_detail(r: StaticRefusal) -> Str []
 //     println("${staticerr.looks_like_probing(staticerr.StaticTraversal(1))}")
 // ```
 pub fn looks_like_probing(r: StaticRefusal) -> Bool []
-    todo("static-nv.staticerr.looks_like_probing")
+    match r
+        StaticTraversal(_)        => true
+        StaticEncodedSeparator(_) => true
+        StaticNulByte(_)          => true
+        StaticControlByte(_, _)   => true
+        // A backslash is not in a link either: it arrives in a probe
+        // spelled for the platform where it is a separator.
+        StaticBackslash(_)        => true
+        StaticHiddenSegment(_)    => false
+        StaticTooDeep(_, _)       => false
+        StaticTooLong(_, _)       => false
+        StaticNotRooted           => false
 
 // Whether a fault is the deployment's rather than the request's.
 //
@@ -187,7 +218,12 @@ pub fn looks_like_probing(r: StaticRefusal) -> Bool []
 //     println("${staticerr.is_configuration_fault(f)}")
 // ```
 pub fn is_configuration_fault(f: StaticFault) -> Bool []
-    todo("static-nv.staticerr.is_configuration_fault")
+    match f
+        StaticRootUnreadable(_, _)     => true
+        StaticFileUnreadable(_, _)     => false
+        StaticRangeRefused(_)          => false
+        StaticRangeUnsatisfiable(_, _) => false
+        StaticNoIndex(_)               => false
 
 // Every refusal this package can answer, as strings a person can read.
 //
@@ -203,4 +239,6 @@ pub fn is_configuration_fault(f: StaticFault) -> Bool []
 //     println("${list.len(staticerr.refusal_names())}")
 // ```
 pub fn refusal_names() -> [Str] []
-    todo("static-nv.staticerr.refusal_names")
+    ["traversal", "encoded-separator", "nul-byte", "control-byte",
+     "backslash", "hidden-segment", "too-deep", "too-long",
+     "not-rooted"]

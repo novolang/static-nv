@@ -1,0 +1,1066 @@
+// static_edge_tests.nv — the edges of every module: a real directory,
+// and the arms a table of rules does not reach.
+//
+// The five suites beside this one create nothing: their paths are
+// under a name that does not exist, so they assert that a call answers
+// rather than what it answers.  This file writes a root under
+// `fs.temp_dir()` — a file, a precompressed sibling, a dotfile, two
+// directories, names that need escaping into HTML, and a symbolic link
+// out of the root — and drives the walk, the scan, the lookups, the
+// positional read, the listings and the two serve calls through it.
+//
+// The half below that one reads no disk at all: a fault's message, a
+// `q` weight nobody can read, a conditional header the precedence
+// table reaches for one of its forms, a `Range` that is none of the
+// three productions.  An arm nothing runs is an arm nobody has read,
+// so the ones a happy path leaves are driven rather than excused.
+//
+// It is also the file that exercises the places where an unbalanced
+// reference would show, so a run's leak check has something to read.
+//
+// Every test writes its own tree: a test that reused a directory would
+// be asserting on another test's leftovers.  `clear_site` removes it
+// again, and nothing outside `fs.temp_dir()` is ever written.
+
+use std.test
+use std.bytes
+use std.fs
+use std.list
+use std.str
+use civil
+use staticenc
+use staticerr
+use staticfs
+use staticmeta
+use staticpath
+use staticrange
+
+// A served root with content in it, under a fresh temporary directory.
+//
+// The names are the ones the `[]` suites cannot reach: a walk with a
+// second level under it, a sibling the walk indexes beside its file, a
+// dotfile the policy refuses, the five characters a listing has to
+// escape, and a link pointing at a file outside the root.
+//
+// `BASE/outside.txt` is the file the link names, and it is outside the
+// served root on purpose: it is what the containment rule does not
+// cover, and one test below measures that rather than claiming it.
+//
+// Two modification times are pinned so that a `Last-Modified` is a
+// literal in the assertions rather than a number that changes with the
+// machine — one after the epoch and one before it, which is the
+// difference between a division and a floor.
+fn a_site() -> Str [fs]
+    let base = fs.temp_dir()
+    let site = base + "/site"
+    let _ = fs.mkdir(site)
+    let _ = fs.mkdir(site + "/plain")
+    let _ = fs.mkdir(site + "/docs")
+    let _ = fs.mkdir(site + "/deep")
+    let _ = fs.mkdir(site + "/deep/inner")
+    let _ = fs.write(site + "/index.html", "hello index\n")
+    let _ = fs.write(site + "/a.txt", "0123456789")
+    let _ = fs.write(site + "/LICENSE", "license\n")
+    let _ = fs.write(site + "/a.txt.gz", "GZB-gzip-bytes")
+    let _ = fs.write(site + "/a<b.txt", "lt")
+    let _ = fs.write(site + "/amp&.txt", "amp")
+    let _ = fs.write(site + "/gt>.txt", "gt")
+    let _ = fs.write(site + "/quote\".txt", "q")
+    let _ = fs.write(site + "/squote'.txt", "s")
+    let _ = fs.write(site + "/.hidden.txt", "hidden")
+    let _ = fs.write(site + "/docs/index.html", "docs index\n")
+    let _ = fs.write(site + "/deep/inner/leaf.txt", "leaf\n")
+    let _ = fs.write(site + "/plain/nope.txt", "nope\n")
+    let _ = fs.write(base + "/outside.txt", "outside the root\n")
+    let _ = fs.symlink(base + "/outside.txt", site + "/escape.txt")
+    let _ = fs.set_file_mtime(site + "/index.html", 1700000000)
+    let _ = fs.set_file_mtime(site + "/a.txt", -3600)
+    site
+
+// Everything `a_site` wrote, removed again, deepest first, because a
+// directory that is not empty is not deletable.  A suite that filled
+// `/tmp` would be a failure on the machine of whoever ran it next.
+fn clear_site(site: Str) [fs]
+    let names = ["a.txt", "a.txt.gz", "a<b.txt", "amp&.txt", "gt>.txt", "LICENSE",
+                 "quote\".txt", "squote'.txt", ".hidden.txt", "escape.txt",
+                 "index.html", "pct%20.txt", "q?m.txt", "h#m.txt",
+                 "deep/inner/leaf.txt", "docs/index.html",
+                 "plain/nope.txt", "deep/inner", "deep", "docs", "plain",
+                 "../outside.txt"]
+    for name in names
+        let _ = fs.delete(site + "/" + name)
+    let _ = fs.delete(site)
+
+// The header slots: `serve` and `serve_live` take `fn(Str) -> Str []`,
+// a lookup by name rather than a request type, so a test drives them
+// from these.  Each one names one scenario.
+//
+// `84d89877f0d4041efb6bf91a16f0248f` is the first sixteen bytes of the
+// SHA-256 of `0123456789`, which is what `a.txt` holds: the digest the
+// scan computes for that file, written out so a request can carry it.
+fn no_headers(name: Str) -> Str
+    ""
+
+fn matching_validator(name: Str) -> Str
+    if name == "If-None-Match"
+        "\"84d89877f0d4041efb6bf91a16f0248f\""
+    else
+        ""
+
+fn stale_validator(name: Str) -> Str
+    if name == "If-None-Match"
+        "\"00000000000000000000000000000000\""
+    else
+        ""
+
+fn failed_precondition(name: Str) -> Str
+    if name == "If-Match"
+        "\"00000000000000000000000000000000\""
+    else
+        ""
+
+fn one_range(name: Str) -> Str
+    if name == "Range"
+        "bytes=2-5"
+    else
+        ""
+
+fn two_ranges(name: Str) -> Str
+    if name == "Range"
+        "bytes=0-1,4-5"
+    else
+        ""
+
+fn a_range_past_the_end(name: Str) -> Str
+    if name == "Range"
+        "bytes=99-200"
+    else
+        ""
+
+// A `Range` the parser refuses rather than resolves: one item, and
+// none of § 14.1.1's three productions.
+fn malformed_range(name: Str) -> Str
+    if name == "Range"
+        "bytes=5"
+    else
+        ""
+
+fn range_with_a_validator(name: Str) -> Str
+    if name == "Range"
+        "bytes=0-1"
+    else if name == "If-Range"
+        "\"84d89877f0d4041efb6bf91a16f0248f\""
+    else
+        ""
+
+fn gzip_accepted(name: Str) -> Str
+    if name == "Accept-Encoding"
+        "gzip"
+    else
+        ""
+
+fn brotli_accepted(name: Str) -> Str
+    if name == "Accept-Encoding"
+        "br"
+    else
+        ""
+
+fn nothing_accepted(name: Str) -> Str
+    if name == "Accept-Encoding"
+        "*;q=0"
+    else
+        ""
+
+// The body of an answer as text, for the assertions that read bytes.
+fn text_of(b: Bytes) -> Str
+    bytes.to_str(b)
+
+// `list.get` with a fallback, so an assertion reads an element by
+// index without a match around it.
+fn name_at(names: [Str], i: Int) -> Str
+    list.get(names, i, "")
+
+@test
+fn test_a_scan_of_a_real_root_holds_every_file_and_no_directory() [io, fs]
+    // The walk is the one place this package enumerates a directory,
+    // so the file count here is the policy's answer rather than the
+    // filesystem's: a dotfile is left out and a directory is not an
+    // entry of its own.
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.case("twelve files, and no directory among them")
+            test.assert(staticfs.index_len(ix) == 13)
+            let paths = staticfs.index_paths(ix)
+            test.assert_eq_str(name_at(paths, 0), "LICENSE")
+            test.assert_eq_str(name_at(paths, 1), "a.txt")
+            test.assert_eq_str(name_at(paths, 12), "squote'.txt")
+            test.assert(not list.contains(paths, "plain"))
+            test.assert(not list.contains(paths, ".hidden.txt"))
+            test.assert(list.contains(paths, "deep/inner/leaf.txt"))
+
+            test.case("and the walk asks the policy about every name it meets")
+            let shallow = StaticPolicy {
+                index_names: ["index.html"],
+                list_directories: false,
+                serve_hidden: false,
+                redirect_directories: true,
+                max_segments: 1,
+                max_bytes: 1024 }
+            let near = staticfs.with_policy(staticfs.root(site), shallow)
+            match staticfs.scan(near)
+                Err(_) => test.assert(false)
+                Ok(nx) =>
+                    test.assert(staticfs.index_len(nx) == 10)
+                    test.assert(not list.contains(staticfs.index_paths(nx), "deep/inner/leaf.txt"))
+    clear_site(site)
+
+@test
+fn test_an_entry_is_the_content_hash_of_the_bytes_on_disk() [io, fs]
+    // The index's validator is the file's own bytes, not its name or
+    // its size: the same value `entry` computes from bytes in hand.
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            let found = staticfs.lookup(ix, "a.txt")
+            let Some(e) = found else
+                test.fail("a.txt is not in an index of its own root")
+                return
+            test.case("the etag is the digest of the ten bytes")
+            test.assert_eq_str(e.etag, staticmeta.entry("a.txt", bytes.from_str("0123456789")).etag)
+            test.assert_eq_str(e.etag, "\"84d89877f0d4041efb6bf91a16f0248f\"")
+            test.assert(e.size == 10)
+            test.assert(str.starts_with(e.content_type, "text/plain"))
+
+            test.case("and its own modification time came along")
+            test.assert_some(e.modified_at)
+    clear_site(site)
+
+@test
+fn test_a_whole_answer_reads_the_file_and_names_it() [io, fs]
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            match staticfs.serve(ix, "/index.html", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.case("200 with the bytes")
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(text_of(s.body), "hello index\n")
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Length"), "12")
+                    test.assert(str.starts_with(staticfs.served_header(s, "Content-Type"),
+                                                "text/html"))
+
+                    test.case("the validators and the three headers every answer carries")
+                    test.assert_eq_str(staticfs.served_header(s, "ETag"),
+                                       "\"95b1a69c92fd454fa96afb8fa2331898\"")
+                    test.assert_eq_str(staticfs.served_header(s, "Last-Modified"),
+                                       "Tue, 14 Nov 2023 22:13:20 GMT")
+                    test.assert_eq_str(staticfs.served_header(s, "Vary"), "Accept-Encoding")
+                    test.assert_eq_str(staticfs.served_header(s, "Accept-Ranges"), "bytes")
+                    test.assert_eq_str(staticfs.served_header(s, "X-Content-Type-Options"),
+                                       "nosniff")
+
+            test.case("a modification time before the epoch is a date too")
+            match staticfs.serve(ix, "/a.txt", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert_eq_str(staticfs.served_header(s, "Last-Modified"),
+                                       "Wed, 31 Dec 1969 23:00:00 GMT")
+    clear_site(site)
+
+@test
+fn test_a_head_answers_the_headers_of_its_get_and_no_body() [io, fs]
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            match staticfs.serve(ix, "/index.html", "", no_headers, true)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert(bytes.len(s.body) == 0)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Length"), "12")
+                    test.assert_eq_str(staticfs.served_header(s, "ETag"),
+                                       "\"95b1a69c92fd454fa96afb8fa2331898\"")
+    clear_site(site)
+
+@test
+fn test_a_validator_the_client_holds_is_a_304_and_a_stale_one_is_not() [io, fs]
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.case("the etag the client has is the file's")
+            match staticfs.serve(ix, "/a.txt", "", matching_validator, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 304)
+                    test.assert(bytes.len(s.body) == 0)
+                    test.assert_eq_str(staticfs.served_header(s, "ETag"),
+                                       "\"84d89877f0d4041efb6bf91a16f0248f\"")
+
+            test.case("a validator that is not the file's answers the file")
+            match staticfs.serve(ix, "/a.txt", "", stale_validator, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(text_of(s.body), "0123456789")
+
+            test.case("a precondition that fails is a 412 and not a body")
+            match staticfs.serve(ix, "/a.txt", "", failed_precondition, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 412)
+                    test.assert(bytes.len(s.body) == 0)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Length"), "0")
+    clear_site(site)
+
+@test
+fn test_a_range_is_read_positionally_and_a_miss_is_a_416() [io, fs]
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.case("206, four bytes from offset two")
+            match staticfs.serve(ix, "/a.txt", "", one_range, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 206)
+                    test.assert_eq_str(text_of(s.body), "2345")
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Range"), "bytes 2-5/10")
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Length"), "4")
+
+            test.case("a matching If-Range leaves the range answer alone")
+            match staticfs.serve(ix, "/a.txt", "", range_with_a_validator, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 206)
+                    test.assert_eq_str(text_of(s.body), "01")
+
+            test.case("every range past the end is a 416 naming the size")
+            match staticfs.serve(ix, "/a.txt", "", a_range_past_the_end, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 416)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Range"), "bytes */10")
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Length"), "0")
+                    test.assert(bytes.len(s.body) == 0)
+    clear_site(site)
+
+@test
+fn test_two_ranges_are_one_multipart_body_whose_length_is_the_arithmetic() [io, fs]
+    // `multipart_len` exists because a multipart body is longer than
+    // its parts; this is the case where the two have to agree.
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            match staticfs.serve(ix, "/a.txt", "", two_ranges, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    let boundary = "nova" + "84d89877f0d4041efb6bf91a16f0248f"
+                    test.case("206 with a boundary taken from the entry's own digest")
+                    test.assert(s.status == 206)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Type"),
+                                       staticrange.multipart_type(boundary))
+                    test.case("both parts are in the body, and the length is the body's")
+                    let body = text_of(s.body)
+                    test.assert(str.contains(body, "01"))
+                    test.assert(str.contains(body, "45"))
+                    test.assert(str.starts_with(body, "--" + boundary))
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Length"),
+                                       str.from_int(bytes.len(s.body)))
+
+            test.case("a name with no media type still has one per part")
+            match staticfs.serve(ix, "/LICENSE", "", two_ranges, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 206)
+                    test.assert(str.contains(text_of(s.body), "application/octet-stream"))
+    clear_site(site)
+
+@test
+fn test_a_precompressed_sibling_goes_out_under_its_own_validator() [io, fs]
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.case("the sibling's bytes, the sibling's etag, the coding named")
+            match staticfs.serve(ix, "/a.txt", "", gzip_accepted, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Encoding"), "gzip")
+                    test.assert_eq_str(text_of(s.body), "GZB-gzip-bytes")
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Length"), "14")
+                    test.assert_eq_str(staticfs.served_header(s, "Vary"), "Accept-Encoding")
+                    match staticfs.lookup(ix, "a.txt.gz")
+                        Some(gz) => test.assert_eq_str(staticfs.served_header(s, "ETag"), gz.etag)
+                        None     => test.assert(false)
+
+            test.case("a coding with no sibling beside it is the file itself")
+            match staticfs.serve(ix, "/a.txt", "", brotli_accepted, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Encoding"), "")
+                    test.assert_eq_str(text_of(s.body), "0123456789")
+
+            test.case("a client that accepts nothing it can decode is a 406")
+            match staticfs.serve(ix, "/a.txt", "", nothing_accepted, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 406)
+                    test.assert(bytes.len(s.body) == 0)
+    clear_site(site)
+
+@test
+fn test_an_index_that_has_parted_from_the_disk_serves_the_file_itself() [io, fs]
+    // What an index is for, and what it costs: the scan reports the
+    // sibling, and the bytes behind it left between the scan and the
+    // request.  A coding named over bytes that are not those bytes is
+    // the one answer worse than a miss, so the file goes out as
+    // identity instead.
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.assert(staticfs.encodings_of(ix, "a.txt").has_gzip)
+            let _ = fs.delete(site + "/a.txt.gz")
+            match staticfs.serve(ix, "/a.txt", "", gzip_accepted, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Encoding"), "")
+                    test.assert_eq_str(text_of(s.body), "0123456789")
+                    test.assert_eq_str(staticfs.served_header(s, "ETag"),
+                                       "\"84d89877f0d4041efb6bf91a16f0248f\"")
+    clear_site(site)
+
+@test
+fn test_a_sibling_that_cannot_be_read_is_answered_as_the_file_itself() [io, fs]
+    // The live path asks the filesystem whether the sibling is there
+    // and then reads it, and those are two questions.  A sibling that
+    // answers the first and not the second — a file nobody can read —
+    // is answered with the file's own bytes rather than with a coding
+    // label over them.
+    let site = a_site()
+    let _ = fs.write(site + "/b.txt", "plain text")
+    let _ = fs.write(site + "/b.txt.gz", "unreadable")
+    let _ = fs.set_file_mode(site + "/b.txt.gz", 0)
+    let root = staticfs.root(site)
+    let refused = fs.read_bytes(site + "/b.txt.gz")
+    match refused
+        Some(_) => test.assert(true)
+        None    =>
+            test.case("the sibling is there and unreadable")
+            match staticfs.serve_live(root, "/b.txt", "", gzip_accepted, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Encoding"), "")
+                    test.assert_eq_str(text_of(s.body), "plain text")
+    let _ = fs.delete(site + "/b.txt.gz")
+    let _ = fs.delete(site + "/b.txt")
+    clear_site(site)
+
+@test
+fn test_a_directory_answers_its_index_file_or_a_redirect_with_the_query() [io, fs]
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.case("no trailing slash is a 301 that keeps the query")
+            match staticfs.serve(ix, "/docs", "lang=en", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 301)
+                    test.assert_eq_str(staticfs.served_header(s, "Location"), "/docs/?lang=en")
+
+            test.case("with one, the directory's index file is the answer")
+            match staticfs.serve(ix, "/docs/", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(text_of(s.body), "docs index\n")
+
+            test.case("and a directory with no index file at all is a fault")
+            match staticfs.serve(ix, "/plain/", "", no_headers, false)
+                Err(f) => test.assert(staticerr.status_for(f) == 404)
+                Ok(s)  => test.assert(s.status == 404)
+
+            test.case("the root itself is its own index file")
+            match staticfs.serve(ix, "/", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(text_of(s.body), "hello index\n")
+    clear_site(site)
+
+@test
+fn test_a_listing_is_a_page_of_escaped_names_when_the_policy_allows_one() [io, fs]
+    // A name is data the deployment did not write, and a listing that
+    // pastes one into markup is a stored cross-site script.  Five of
+    // the names in this root are the five characters that matter in
+    // markup; three more are the bytes that matter in a URL.  The
+    // policy names no index file, so `/` itself is the listing rather
+    // than the `index.html` sitting in it.
+    let site = a_site()
+    // Three names a browser would not fetch as written, added here
+    // rather than in `a_site` so the root the other tests scan keeps
+    // the shape their counts assert: the `%` of `pct%20.txt` reaches
+    // the server as a space unless it is escaped, and `?` and `#` end
+    // the path in the URL grammar.
+    let _ = fs.write(site + "/pct%20.txt", "twenty\n")
+    let _ = fs.write(site + "/q?m.txt", "question\n")
+    let _ = fs.write(site + "/h#m.txt", "hash\n")
+    let listing = staticpath.with_index_names(staticpath.defaults(), [])
+    let reading = staticfs.with_policy(staticfs.root(site),
+                                       staticpath.with_listings(listing))
+    match staticfs.scan(reading)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            match staticfs.serve(ix, "/", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    let page = text_of(s.body)
+                    test.case("200 and a page")
+                    test.assert(s.status == 200)
+                    test.assert(str.starts_with(staticfs.served_header(s, "Content-Type"),
+                                                "text/html"))
+
+                    test.case("the five characters are escaped in the hrefs")
+                    test.assert(str.contains(page, "./amp&amp;.txt"))
+                    test.assert(str.contains(page, "./a&lt;b.txt"))
+                    test.assert(str.contains(page, "./gt&gt;.txt"))
+                    test.assert(str.contains(page, "./quote&quot;.txt"))
+                    test.assert(str.contains(page, "./squote&#39;.txt"))
+
+                    test.case("and a directory links to its trailing-slash form")
+                    test.assert(str.contains(page, "./deep/"))
+                    test.assert(not str.contains(page, "./.hidden.txt"))
+
+                    test.case("a percent, a query mark and a hash are escaped in the href")
+                    test.assert(str.contains(page, "./pct%2520.txt"))
+                    test.assert(str.contains(page, "./q%3Fm.txt"))
+                    test.assert(str.contains(page, "./h%23m.txt"))
+                    test.assert(str.contains(page, ">pct%20.txt</a>"))
+
+                    test.case("and the escaped href, requested as it stands, is the file")
+                    match staticfs.serve(ix, "/pct%2520.txt", "", no_headers, false)
+                        Err(_) => test.assert(false)
+                        Ok(f)  =>
+                            test.assert(f.status == 200)
+                            test.assert_eq_str(text_of(f.body), "twenty\n")
+
+                    test.case("the length is the page's own length")
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Length"),
+                                       str.from_int(bytes.len(s.body)))
+
+            test.case("a HEAD on a listing is the headers its GET would send and no page")
+            match staticfs.serve(ix, "/plain/", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(g)  =>
+                    let length = staticfs.served_header(g, "Content-Length")
+                    test.assert_eq_str(length, str.from_int(bytes.len(g.body)))
+                    match staticfs.serve(ix, "/plain/", "", no_headers, true)
+                        Err(_) => test.assert(false)
+                        Ok(h)  =>
+                            test.assert(h.status == 200)
+                            test.assert(bytes.len(h.body) == 0)
+                            test.assert_eq_str(staticfs.served_header(h, "Content-Length"), length)
+    clear_site(site)
+
+@test
+fn test_the_stamp_a_scan_was_given_is_what_a_listing_dates_itself_from() [io, fs]
+    let site = a_site()
+    let reading = staticfs.with_policy(staticfs.root(site),
+                                       staticpath.with_listings(staticpath.defaults()))
+    let at = civil.datetime(civil.date_from_epoch_day(19675), civil.midnight())
+    match staticfs.scan_at(reading, at)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            match staticfs.serve(ix, "/plain/", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(staticfs.served_header(s, "Last-Modified"),
+                                       staticmeta.format_http_date(at))
+    clear_site(site)
+
+@test
+fn test_a_refused_target_and_a_policy_that_hides_a_file() [io, fs]
+    let site = a_site()
+    match staticfs.scan(staticfs.root(site))
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.case("a traversal is refused as a 404, with no reason attached")
+            match staticfs.serve(ix, "/../etc/passwd", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 404)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Length"), "0")
+
+            test.case("a dotfile is not servable under the default policy")
+            match staticfs.serve(ix, "/.hidden.txt", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  => test.assert(s.status == 404)
+
+            test.case("a file that is not there is the same 404")
+            match staticfs.serve(ix, "/nothing.txt", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  => test.assert(s.status == 404)
+
+            test.case("and a policy that serves dotfiles has it indexed")
+            let open = staticfs.with_policy(staticfs.root(site),
+                                            staticpath.with_hidden(staticpath.defaults()))
+            match staticfs.scan(open)
+                Err(_) => test.assert(false)
+                Ok(hx) =>
+                    test.assert(staticfs.index_len(hx) == 14)
+                    match staticfs.serve(hx, "/.hidden.txt", "", no_headers, false)
+                        Err(_) => test.assert(false)
+                        Ok(s)  =>
+                            test.assert(s.status == 200)
+                            test.assert_eq_str(text_of(s.body), "hidden")
+    clear_site(site)
+
+@test
+fn test_serve_live_reads_the_root_now_and_answers_the_same_four_things() [io, fs]
+    let site = a_site()
+    let root = staticfs.root(site)
+    let reading = staticfs.with_policy(root, staticpath.with_listings(staticpath.defaults()))
+
+    test.case("a file")
+    match staticfs.serve_live(root, "/index.html", "", no_headers, false)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert(s.status == 200)
+            test.assert_eq_str(text_of(s.body), "hello index\n")
+            test.assert_eq_str(staticfs.served_header(s, "ETag"),
+                               "\"95b1a69c92fd454fa96afb8fa2331898\"")
+
+    test.case("a directory's index file")
+    match staticfs.serve_live(root, "/docs/", "", no_headers, false)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert(s.status == 200)
+            test.assert_eq_str(text_of(s.body), "docs index\n")
+
+    test.case("a redirect")
+    match staticfs.serve_live(root, "/docs", "", no_headers, false)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.status == 301)
+
+    test.case("a listing, and its directory's own modification time")
+    match staticfs.serve_live(reading, "/plain/", "", no_headers, false)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert(s.status == 200)
+            test.assert(str.contains(text_of(s.body), "./nope.txt"))
+
+    test.case("a 404")
+    match staticfs.serve_live(root, "/nothing.txt", "", no_headers, false)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.status == 404)
+
+    test.case("a gzip sibling, read now rather than remembered")
+    match staticfs.serve_live(root, "/a.txt", "", gzip_accepted, false)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert_eq_str(staticfs.served_header(s, "Content-Encoding"), "gzip")
+            test.assert_eq_str(text_of(s.body), "GZB-gzip-bytes")
+
+    test.case("and a root that is not a directory is the deployment's fault")
+    match staticfs.serve_live(staticfs.root(site + "/gone"), "/index.html", "",
+                              no_headers, false)
+        Err(f) => test.assert(staticerr.is_configuration_fault(f))
+        Ok(_)  => test.assert(false)
+    clear_site(site)
+
+@test
+fn test_the_positional_reads_and_the_stat_that_reads_now() [io, fs]
+    let site = a_site()
+    let root = staticfs.root(site)
+    match staticfs.scan(root)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.case("a range of a file, and one past its end")
+            let span = StaticRange { first: 2, last: 5 }
+            match staticfs.read_range(root, "a.txt", span)
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert_eq_str(text_of(b), "2345")
+            let beyond = StaticRange { first: 99, last: 200 }
+            match staticfs.read_range(root, "a.txt", beyond)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(false)
+
+            test.case("a directory is not a file, on both reads")
+            match staticfs.read_all(root, "plain")
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(false)
+            match staticfs.read_all(root, "nothing.txt")
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(false)
+            match staticfs.read_all(root, "index.html")
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert_eq_str(text_of(b), "hello index\n")
+
+            test.case("and the stat agrees with the index it was scanned into")
+            let live = staticfs.stat_one(root, "a.txt")
+            let stored = staticfs.lookup(ix, "a.txt")
+            match live
+                Err(_) => test.assert(false)
+                Ok(e)  =>
+                    match stored
+                        Some(s) => test.assert_eq_str(e.etag, s.etag)
+                        None    => test.assert(false)
+            match staticfs.stat_one(root, "plain")
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(false)
+    clear_site(site)
+
+@test
+fn test_kind_of_answers_three_kinds_and_the_listing_is_sorted() [io, fs]
+    let site = a_site()
+    let root = staticfs.root(site)
+    test.case("the three answers")
+    test.assert(staticfs.kind_of(root, "a.txt") == staticpath.kind_file())
+    test.assert(staticfs.kind_of(root, "plain") == staticpath.kind_directory())
+    test.assert(staticfs.kind_of(root, "nothing.txt") == staticpath.kind_missing())
+
+    test.case("directories first, each with a trailing slash, then files")
+    match staticfs.list_dir(root, "")
+        Err(_)    => test.assert(false)
+        Ok(names) =>
+            test.assert(list.len(names) == 13)
+            test.assert_eq_str(name_at(names, 0), "deep/")
+            test.assert_eq_str(name_at(names, 1), "docs/")
+            test.assert_eq_str(name_at(names, 2), "plain/")
+            test.assert_eq_str(name_at(names, 3), "LICENSE")
+            test.assert_eq_str(name_at(names, 12), "squote'.txt")
+            test.assert(not list.contains(names, ".hidden.txt"))
+    match staticfs.list_dir(root, "nothing")
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+    clear_site(site)
+
+@test
+fn test_a_symlink_out_of_the_root_is_served_and_that_is_the_limit() [io, fs]
+    // The one test that measures the containment rule instead of
+    // restating it.  Every segment of `escape.txt` is a name the
+    // resolver allows, the path is inside the root as a string, and
+    // the bytes that come back are outside it: `containment_is_lexical_only`
+    // answers `true` because this is what it means.
+    let site = a_site()
+    let root = staticfs.root(site)
+    test.case("the walk indexed the link's target")
+    match staticfs.scan(root)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.assert(list.contains(staticfs.index_paths(ix), "escape.txt"))
+            match staticfs.read_all(root, "escape.txt")
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert_eq_str(text_of(b), "outside the root\n")
+    test.case("and the package says so rather than implying otherwise")
+    test.assert(staticfs.containment_is_lexical_only())
+    clear_site(site)
+
+// ── The arms a table-driven suite leaves ─────────────────────────────
+
+// The five suites beside this one assert the rules they name and not
+// the arms behind them: a fault's message, a header whose weight
+// nobody can read, a conditional header the precedence table reaches
+// only for one of its five forms.  An arm nothing runs is an arm
+// nobody has read, so the ones below are driven here rather than
+// excused — and the three that no filesystem this package can reach
+// would produce are marked where they stand: `clock_time` refusing
+// three integers that are in range by construction, and the two
+// `fs.file_mtime` answers of none, for a file and a directory a walk
+// has just read.
+
+@test
+fn test_every_refusal_carries_a_detail_a_status_and_a_probing_verdict() [io]
+    // A refusal is a value rather than a failure, so the half a client
+    // never sees is asserted here: the detail a log holds, and the
+    // count a deployment graphs.
+    let probing: [staticerr.StaticRefusal] = [
+        staticerr.StaticTraversal(1), staticerr.StaticEncodedSeparator(2),
+        staticerr.StaticNulByte(3), staticerr.StaticControlByte(4, 7),
+        staticerr.StaticBackslash(5)]
+    for r in probing
+        test.assert(str.len(staticerr.refusal_detail(r)) > 0)
+        test.assert(staticerr.looks_like_probing(r))
+        test.assert(staticerr.refusal_status(r) == 404)
+    let accidental: [staticerr.StaticRefusal] = [
+        staticerr.StaticHiddenSegment(1), staticerr.StaticTooDeep(40, 32),
+        staticerr.StaticTooLong(2000, 1024), staticerr.StaticNotRooted]
+    for r in accidental
+        test.assert(str.len(staticerr.refusal_detail(r)) > 0)
+        test.assert(not staticerr.looks_like_probing(r))
+        test.assert(staticerr.refusal_status(r) == 404)
+
+    test.case("the detail names the segment, the byte and the ceiling")
+    test.assert_eq_str(staticerr.refusal_detail(staticerr.StaticControlByte(4, 7)),
+                       "segment 4 holds control byte 7")
+    test.assert_eq_str(staticerr.refusal_detail(staticerr.StaticTooLong(2000, 1024)),
+                       "the path is 2000 bytes, the ceiling is 1024")
+
+    test.case("and the names are the list a reader audits")
+    let names = staticerr.refusal_names()
+    test.assert(list.len(names) == 9)
+    test.assert_eq_str(name_at(names, 0), "traversal")
+    test.assert_eq_str(name_at(names, 8), "not-rooted")
+
+    test.case("a refusal reports itself through Error")
+    let hidden = staticerr.StaticHiddenSegment(2)
+    test.assert_eq_str(hidden.message(), "segment 2 is a dotfile")
+
+    test.case("a fault too, one message per variant")
+    test.assert_eq_str(staticerr.StaticNoIndex("/srv/site/docs").message(),
+                       "no index in /srv/site/docs")
+    test.assert_eq_str(staticerr.StaticRangeRefused("too many").message(),
+                       "range refused: too many")
+    test.assert_eq_str(staticerr.StaticRangeUnsatisfiable(99, 10).message(),
+                       "byte 99 is past the end of a 10-byte file")
+    test.assert_eq_str(staticerr.StaticFileUnreadable("/srv/site/a.txt", "gone").message(),
+                       "file /srv/site/a.txt: gone")
+    test.assert_eq_str(staticerr.StaticRootUnreadable("/srv/site", "gone").message(),
+                       "root /srv/site: gone")
+
+    test.case("and only the unreadable root is the deployment's fault")
+    test.assert(staticerr.is_configuration_fault(staticerr.StaticRootUnreadable("/s", "d")))
+    test.assert(not staticerr.is_configuration_fault(staticerr.StaticFileUnreadable("/s", "d")))
+    test.assert(not staticerr.is_configuration_fault(staticerr.StaticRangeRefused("d")))
+    test.assert(not staticerr.is_configuration_fault(staticerr.StaticRangeUnsatisfiable(1, 2)))
+    test.assert(not staticerr.is_configuration_fault(staticerr.StaticNoIndex("/s")))
+
+@test
+fn test_a_weight_this_package_cannot_read_is_not_a_permission() [io]
+    // § 12.5.3 lets the weight be absent, and a header carrying a
+    // weight nobody can read is not a client saying yes to anything.
+    test.assert(staticenc.quality_of("gzip;q=", "gzip") == 0)
+    test.assert(staticenc.quality_of("gzip;q=-1", "gzip") == 0)
+    test.assert(staticenc.quality_of("gzip;q=0.x", "gzip") == 0)
+    test.assert(staticenc.quality_of("gzip;q=abc", "gzip") == 0)
+    test.assert(staticenc.quality_of("gzip;q=0.5", "gzip") == 500)
+
+    test.case("a weight over one is one, which is all it can mean")
+    test.assert(staticenc.quality_of("gzip;q=1.5", "gzip") == 1000)
+
+@test
+fn test_the_suffix_names_a_coding_and_identity_is_always_on_offer() [io]
+    test.assert(staticenc.coding_of_path("css/site.css.gz") == staticenc.StaticGzip)
+    test.assert(staticenc.coding_of_path("css/site.css.zst") == staticenc.StaticZstd)
+    test.assert(staticenc.coding_of_path("css/site.css.br") == staticenc.StaticBrotli)
+    test.assert(staticenc.coding_of_path("css/site.css") == staticenc.StaticIdentity)
+
+    test.case("identity may be named in a preference, and only a client refuses it")
+    let order = [staticenc.StaticIdentity, staticenc.StaticGzip]
+    let e = staticenc.with_preference(staticenc.available(true, true, true), order)
+    match staticenc.choose("identity", e)
+        Some(c) => test.assert(c == staticenc.StaticIdentity)
+        None    => test.assert(false)
+    test.case("and a client that does not name it gets what it did name")
+    match staticenc.choose("gzip", e)
+        Some(c) => test.assert(c == staticenc.StaticGzip)
+        None    => test.assert(false)
+
+@test
+fn test_the_conditional_forms_the_precedence_table_leaves() [io]
+    // The table's five headers, against an entry that has a
+    // modification time and one that does not: what a date that cannot
+    // be parsed does, and what `If-Match: *` means where a tag list was
+    // expected.
+    let undated = staticmeta.entry("a.txt", bytes.from_byte_list([1, 2, 3]))
+    let at = civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+    let dated = staticmeta.with_modified(undated, at)
+    let stamp = staticmeta.format_http_date(at)
+
+    test.case("If-Match: * is the representation existing, not a tag")
+    let by_star = StaticConditions { if_match: "*", if_none_match: "",
+                                     if_modified_since: "", if_unmodified_since: "",
+                                     if_range: "" }
+    test.assert(staticmeta.evaluate(by_star, undated, true) == 200)
+
+    test.case("a date nothing can parse cannot fail If-Unmodified-Since")
+    let since = StaticConditions { if_match: "", if_none_match: "",
+                                   if_modified_since: "",
+                                   if_unmodified_since: "the day before yesterday",
+                                   if_range: "" }
+    test.assert(staticmeta.evaluate(since, undated, true) == 200)
+    test.assert(staticmeta.evaluate(since, dated, true) == 200)
+
+    test.case("If-Modified-Since is answered by a date the parser reads")
+    let nonsense = StaticConditions { if_match: "", if_none_match: "",
+                                      if_modified_since: "nonesuch",
+                                      if_unmodified_since: "", if_range: "" }
+    test.assert(staticmeta.evaluate(nonsense, dated, true) == 200)
+    let unchanged = StaticConditions { if_match: "", if_none_match: "",
+                                       if_modified_since: stamp,
+                                       if_unmodified_since: "", if_range: "" }
+    test.assert(staticmeta.evaluate(unchanged, dated, true) == 304)
+
+    test.case("If-Range as a date needs a date, an entry's own, and equality")
+    let dated_if_range = StaticConditions { if_match: "", if_none_match: "",
+                                            if_modified_since: "",
+                                            if_unmodified_since: "", if_range: stamp }
+    let unreadable = StaticConditions { if_match: "", if_none_match: "",
+                                        if_modified_since: "",
+                                        if_unmodified_since: "",
+                                        if_range: "nonesuch" }
+    test.assert(not staticmeta.range_allowed(unreadable, dated))
+    test.assert(not staticmeta.range_allowed(dated_if_range, undated))
+    test.assert(staticmeta.range_allowed(dated_if_range, dated))
+
+    test.case("a cache preset that must revalidate says so")
+    let guarded = StaticCache { max_age: 60, shareable: true, immutable: false,
+                                must_revalidate: true }
+    test.assert_eq_str(staticmeta.cache_header(guarded),
+                       "public, max-age=60, must-revalidate")
+
+    test.case("a fingerprint behind a directory, in either case, in a run of eight")
+    test.assert(staticmeta.looks_fingerprinted("assets/app-9f8e7d6c.js"))
+    test.assert(staticmeta.looks_fingerprinted("assets/site.A1B2C3D4.css"))
+    test.assert(not staticmeta.looks_fingerprinted("assets/zzzzzzzzzz.css"))
+
+@test
+fn test_the_range_forms_the_parser_refuses_and_the_bounds_it_carries_out() [io]
+    let lim = staticrange.default_limits()
+    test.case("a suffix with no number in it is not a range")
+    match staticrange.parse("bytes=-", 10, lim)
+        Err(StaticRangeRefused(detail)) => test.assert(str.len(detail) > 0)
+        Err(_)                          => test.assert(false)
+        Ok(_)                           => test.assert(false)
+
+    test.case("an item that is none of the three forms is refused, not half-answered")
+    match staticrange.parse("bytes=5", 10, lim)
+        Err(StaticRangeRefused(detail)) => test.assert(str.len(detail) > 0)
+        Err(_)                          => test.assert(false)
+        Ok(_)                           => test.assert(false)
+
+    test.case("a non-digit on either side of the dash is refused")
+    match staticrange.parse("bytes=1x-2", 10, lim)
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+    match staticrange.parse("bytes=x-2", 10, lim)
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("a suffix of nothing is unsatisfiable, and reports a first byte of 0")
+    match staticrange.parse("bytes=-0", 10, lim)
+        Err(StaticRangeUnsatisfiable(first, size)) =>
+            test.assert(first == 0)
+            test.assert(size == 10)
+        Err(_)                                     => test.assert(false)
+        Ok(_)                                      => test.assert(false)
+
+    test.case("a closed range whose last byte is before its first is not one")
+    test.assert_none(staticrange.resolve_closed(5, 3, 10))
+
+@test
+fn test_the_resolutions_that_name_no_file_and_a_percent_that_is_not_a_triple() [io]
+    test.case("a redirect and a refusal have no relative path")
+    test.assert_eq_str(staticpath.relative_of(staticpath.StaticRedirect("/a/")), "")
+    let refused = staticpath.StaticRefused(staticerr.StaticNotRooted)
+    test.assert_eq_str(staticpath.relative_of(refused), "")
+
+    test.case("an index and a directory answer the path they resolved to")
+    test.assert_eq_str(staticpath.relative_of(staticpath.StaticIndex("docs/index.html")),
+                       "docs/index.html")
+    test.assert_eq_str(staticpath.relative_of(staticpath.StaticDirectory("plain")), "plain")
+
+    test.case("only the first of those two is something to serve")
+    test.assert(staticpath.is_servable(staticpath.StaticIndex("a")))
+    test.assert(not staticpath.is_servable(staticpath.StaticDirectory("a")))
+    test.assert(not staticpath.is_servable(staticpath.StaticRedirect("/a/")))
+    test.assert(not staticpath.is_servable(staticpath.StaticRefused(staticerr.StaticNotRooted)))
+
+    test.case("a percent that does not begin a triple is the literal byte")
+    match staticpath.check("/a%zz.txt", staticpath.defaults())
+        Ok(relative) => test.assert_eq_str(relative, "a%zz.txt")
+        Err(_)       => test.assert(false)
+
+@test
+fn test_a_root_that_negotiates_nothing_and_the_requests_that_end_in_a_file() [io, fs]
+    // The three places a root with `without_encoding` answers from, and
+    // the two requests a file is still the answer to: a `Range` the
+    // parser refused, and a directory with no index file.
+    let site = a_site()
+    let r = staticfs.without_encoding(staticfs.root(site))
+    match staticfs.scan(r)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.case("the scan records that this root offers no sibling")
+            test.assert(not staticfs.encodings_of(ix, "a.txt").has_gzip)
+            test.case("a path the index does not hold offers none either")
+            test.assert(not staticfs.encodings_of(ix, "nothing.css").has_gzip)
+
+            test.case("a refused range is the whole file rather than a 416")
+            match staticfs.serve(ix, "/a.txt", "", malformed_range, false)
+                Err(_) => test.assert(false)
+                Ok(s)  =>
+                    test.assert(s.status == 200)
+                    test.assert_eq_str(staticfs.served_header(s, "Content-Range"), "")
+                    test.assert_eq_str(text_of(s.body), "0123456789")
+
+            test.case("a client that refused everything acceptable is a 406")
+            match staticfs.serve(ix, "/a.txt", "", nothing_accepted, false)
+                Err(_) => test.assert(false)
+                Ok(s)  => test.assert(s.status == 406)
+
+            test.case("a directory with no index file redirects, and without listings refuses")
+            match staticfs.serve(ix, "/plain", "", no_headers, false)
+                Err(_) => test.assert(false)
+                Ok(s)  => test.assert(s.status == 301)
+            match staticfs.serve(ix, "/plain/", "", no_headers, false)
+                Err(f) => test.assert(staticerr.status_for(f) == 404)
+                Ok(s)  => test.assert(s.status == 404)
+
+    test.case("the live path asks the disk and offers no sibling either")
+    test.assert(not staticfs.siblings_of(r, "a.txt").has_gzip)
+    match staticfs.serve_live(r, "/a.txt", "", gzip_accepted, false)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert(s.status == 200)
+            test.assert_eq_str(staticfs.served_header(s, "Content-Encoding"), "")
+
+    test.case("and makes the same four decisions the indexed one makes")
+    match staticfs.serve_live(r, "/plain", "", no_headers, false)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.status == 301)
+    match staticfs.serve_live(r, "/plain/", "", no_headers, false)
+        Err(f) => test.assert(staticerr.status_for(f) == 404)
+        Ok(s)  => test.assert(s.status == 404)
+    match staticfs.serve_live(r, "/a.txt", "", nothing_accepted, false)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.status == 406)
+
+    test.case("and a target the resolver refuses is a 404, not a fault")
+    match staticfs.serve_live(r, "/../etc/passwd", "", no_headers, false)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.status == 404)
+    clear_site(site)
+
+@test
+fn test_a_multipart_boundary_is_the_digest_without_its_weak_prefix() [io, fs]
+    // A weak validator is written `W/"..."`, and a boundary built from
+    // that spelling would carry two characters a part delimiter cannot.
+    // The index here is built by hand because a scan computes a strong
+    // validator for every entry it makes.
+    let site = a_site()
+    let weak_tag = staticmeta.quote_etag_weak("abcdef1234")
+    let one = staticmeta.entry_with_etag("a.txt", 10, weak_tag, true)
+    let ix = StaticIndex { root: staticfs.root(site), entries: [one],
+                           encodings: [staticenc.none_available()], scanned_at: None }
+    match staticfs.serve(ix, "/a.txt", "", two_ranges, false)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert(s.status == 206)
+            test.assert(str.contains(text_of(s.body), "novaabcdef1234"))
+            test.assert(not str.contains(text_of(s.body), "W/"))
+    clear_site(site)

@@ -11,12 +11,6 @@ This package implements them. It is a port of
 [tower-http](https://github.com/tower-rs/tower-http)'s `ServeDir` and
 of [WhiteNoise](https://whitenoise.readthedocs.io).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What serving a file involves
 
 The **root** is the directory a server publishes. A request's target is
@@ -98,10 +92,8 @@ fn main() [io]
         None    => println(staticrange.unsatisfiable_header(e.size))
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: static-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. The tests are the
+specification, and they pass.
 
 ## What the package contains
 
@@ -125,9 +117,9 @@ read of the bytes actually asked for.
 files change while the server runs.
 
 **`staticpath.resolve` and `check` are the resolver on its own.**
-`resolve` answers what kind of thing the target names; `check` answers
-only the relative path or the refusal. Both take a predicate rather
-than touching a disk.
+`resolve` answers what kind of thing the target names, taking a
+predicate instead of touching a disk; `check` answers only the relative
+path or the refusal, against a policy.
 
 **`staticmeta.evaluate` is the conditional-request answer**, as a
 status code. `staticmeta.conditions_of` reads the request's headers
@@ -153,10 +145,11 @@ each, for a caller parsing the header itself.
    separator is refused, not re-split.
 4. **Containment is proved lexically, not against the filesystem.**
    The resolver cannot tell whether `root/uploads/x` is a symbolic link
-   to `/etc/shadow`, and neither can `staticfs`: the standard library
-   answers no symbolic-link question at all, with no `realpath`, no
-   `readlink` and no link flag on any metadata call.
-   `staticfs.containment_is_lexical_only()` answers `true` today, so a
+   to `/etc/shadow`. The standard library can — `fs.realpath`,
+   `fs.is_symlink` and `fs.read_link` are all there — and this package
+   asks none of them, because whether a root may contain a link is a
+   deployment's decision rather than a library's.
+   `staticfs.containment_is_lexical_only()` answers `true`, so a
    deployment can assert on it. A root written by a build is safe. A
    root that accepts uploads and follows links is not.
 5. **Listings and dotfiles are off by default.** A listing publishes
@@ -192,19 +185,21 @@ each, for a caller parsing the header itself.
     equivalent for caching is not the same bytes, and splicing a range
     from a different representation into a client's buffer produces a
     file that is corrupt in the middle with a valid length.
-11. **The validator is a content hash.** The standard library answers
-    no modification time, so the usual size-and-modification-time weak
-    validator cannot be computed here at all. `staticmeta.entry`
-    computes SHA-256 over the bytes, which is a strong validator and
-    therefore usable for `If-Range`. That cost is why `staticfs.scan`
-    exists: once per file at start-up, then a comparison per request.
-    `staticmeta.entry_with_etag` takes a validator the build already
-    computed.
-12. **`Last-Modified` is emitted only from a time the caller
-    supplied.** With no modification time from the filesystem there is
-    nothing truthful to put in it, and it is absent otherwise. `ETag`
-    and `If-None-Match` do the whole job, and section 13.1.3 makes
-    `If-Modified-Since` the weaker of the two.
+11. **The validator is a content hash.** `staticmeta` performs no
+    input or output, so it reads no modification time and the usual
+    size-and-modification-time weak validator is not one it can
+    compute. `staticmeta.entry` computes SHA-256 over the bytes, which
+    is a strong validator and therefore usable for `If-Range`. That
+    cost is why `staticfs.scan` exists: once per file at start-up,
+    then a comparison per request. `staticmeta.entry_with_etag` takes a
+    validator the build already computed.
+12. **`Last-Modified` comes from a real modification time or not at
+    all.** `staticmeta` has no disk in its effect row, so it emits the
+    header only for an entry a caller dated with `with_modified`;
+    `staticfs.scan` dates each entry from `fs.file_mtime`, and a
+    filesystem that answers no time leaves the header absent rather
+    than invented. `ETag` and `If-None-Match` do the whole job, and
+    section 13.1.3 makes `If-Modified-Since` the weaker of the two.
 13. **This package does not compress.** It serves the `.gz` or `.br`
     sibling a build already produced. Compressing per request
     compresses the same file once per requester rather than once per
@@ -250,7 +245,9 @@ is being bounded is amplification.
   uses, and this package does not depend on either.
 - **Following symbolic links, or proving one is not followed.** See
   rule 4.
-- **A modification time.** See rule 11.
+- **A modification time inside `staticmeta`.** Its effect row is empty
+  (rule 11); `fs.file_mtime` is read by `staticfs` at scan time, and by
+  `serve_live` per request.
 - **Writing to a socket.** This package answers a value and the
   caller's server writes it.
 - **Uploads, or anything that writes to the root.**
@@ -277,13 +274,13 @@ is being bounded is amplification.
   the request line, the header fields and the body's framing. It does
   not parse `Range`, `If-None-Match`, `If-Modified-Since` or
   `Accept-Encoding`, which is why those four are parsed here.
-- `std.http_server` in the standard library resolves a path with
-  `url_to_fs_path`, whose containment check is a search for `..`. That
-  check passes `%2e%2e`, `%2F`, a NUL byte and a backslash, and refuses
-  `a..b.txt`, which is a real file name. Around it there is no entity
-  tag, no conditional request, no range, no `Accept-Encoding` and no
-  `Cache-Control`, and reading a file reads all of it to answer any
-  part.
+- `std.http_server` in the standard library is a router, a handler
+  surface and a response writer: `http.server.route`, `json`, `text`,
+  `request_header` and middleware. It serves no file, and it parses no
+  `Range`, `If-None-Match`, `If-Modified-Since` or `Accept-Encoding` —
+  which is why those four are parsed here. `staticfs.serve` takes its
+  header lookup as a `fn(Str) -> Str`, which a handler adapts with
+  `http.server.request_header(req, name) ?? ""`.
 
 ## Tests
 
@@ -293,6 +290,7 @@ novo test tests/staticmeta_tests.nv    # validators, HTTP dates, the precedence 
 novo test tests/staticrange_tests.nv   # the Range grammar and the limits
 novo test tests/staticenc_tests.nv     # Accept-Encoding and sibling choice
 novo test tests/staticfs_tests.nv      # the root, the index and the serve calls
+novo test tests/static_edge_tests.nv   # a real directory, and the arms a table leaves
 ```
 
 The normative sources are RFC 9110 section 8.8.3 for entity tags,
@@ -315,40 +313,17 @@ The other suites assert that `If-None-Match` suppresses the
 `If-Range`, that a range list past either limit is refused at parse,
 and that `Vary` is emitted on an uncompressed response.
 
-The tests compile today and fail at run, each on the
-`not implemented: static-nv.<module>.<fn>` panic that is its body. That
-is the expected state of an interface release. They turn green one at a
-time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| Every `pub struct` and `pub enum` in the six modules | the types are declared |
-| `staticerr.refusal_status`, `.status_for`, `.refusal_detail`, `.looks_like_probing` | no |
-| `staticerr.is_configuration_fault`, `.refusal_names`, `StaticFault.message` | no |
-| `staticpath.defaults`, `.with_listings`, `.with_index_names`, `.with_hidden` | no |
-| `staticpath.resolve`, `.check`, `.relative_of`, `.is_servable`, `.join_root` | no |
-| `staticpath.kind_missing`, `.kind_file`, `.kind_directory` | no |
-| `staticpath.segments`, `.check_segment`, `.has_separator`, `.has_forbidden_byte` | no |
-| `staticpath.is_dot_segment`, `.is_hidden`, `.is_well_known`, `.directory_redirect` | no |
-| `staticmeta.entry`, `.entry_with_etag`, `.with_modified`, `.has_modified`, `.with_type` | no |
-| `staticmeta.quote_etag`, `.quote_etag_weak`, `.etag_strong_eq`, `.etag_weak_eq`, `.parse_etag_list` | no |
-| `staticmeta.format_http_date`, `.parse_http_date`, `.http_date_formats` | no |
-| `staticmeta.no_conditions`, `.conditions_of`, `.evaluate`, `.range_allowed` | no |
-| `staticmeta.fingerprinted`, `.revalidated`, `.uncached`, `.cached_for`, `.cache_header`, `.looks_fingerprinted` | no |
-| `staticrange.default_limits`, `.limits`, `.parse`, `.is_byte_range` | no |
-| `staticrange.total_bytes`, `.range_len`, `.content_range`, `.unsatisfiable_header`, `.accept_ranges` | no |
-| `staticrange.multipart_type`, `.part_header`, `.multipart_end`, `.multipart_len` | no |
-| `staticrange.resolve_closed`, `.resolve_open`, `.resolve_suffix`, `.any_satisfiable` | no |
-| `staticenc.none_available`, `.available`, `.with_preference`, `.choose` | no |
-| `staticenc.quality_of`, `.identity_refused`, `.is_refused` | no |
-| `staticenc.coding_name`, `.coding_suffix`, `.sibling_path`, `.coding_of_path` | no |
-| `staticenc.vary_header`, `.not_acceptable_status`, `.worth_compressing`, `.producing_packages` | no |
-| `staticfs.root`, `.with_policy`, `.with_ranges`, `.without_encoding` | no |
-| `staticfs.scan`, `.scan_at`, `.index_len`, `.lookup`, `.encodings_of`, `.index_paths` | no |
-| `staticfs.kind_of`, `.stat_one`, `.siblings_of`, `.read_range`, `.read_all`, `.list_dir` | no |
-| `staticfs.serve`, `.serve_live`, `.served_header`, `.containment_is_lexical_only` | no |
+`tests/static_edge_tests.nv` is the sixth file, and the only one that
+writes anything. It has two halves. The first builds a directory under
+`fs.temp_dir()` holding a file, a precompressed sibling, a dotfile, a
+symbolic link and a subdirectory, and drives a scan, a lookup, a range
+read, a listing and the two serve calls through it. The second reaches
+the arms a table-driven suite leaves: the detail, the status and the
+probing verdict of all nine refusals, the codings a suffix names and
+the refusal an unreadable weight is, the conditional forms the
+precedence table does not name, the range grammar the parser refuses,
+and a hand-built index holding a weak validator so the multipart
+boundary is asserted without a file to compute one from.
 
 ## Licence
 

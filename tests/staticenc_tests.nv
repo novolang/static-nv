@@ -1,9 +1,6 @@
 // staticenc_tests.nv — the three `Accept-Encoding` rules
 // implementations skip, and the `Vary` header whose absence poisons a
 // cache.
-//
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: static-nv.staticenc.<fn>`.
 
 use std.test
 use std.list

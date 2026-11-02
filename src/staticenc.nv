@@ -1,8 +1,6 @@
 // staticenc.nv — serving the `.gz` and `.br` the build already made,
 // and the `Vary` header without which a cache poisons itself.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS PACKAGE DOES NOT COMPRESS, AND THAT IS THE DESIGN.  A static
 // file server that gzips per request compresses the same file once per
 // requester; a build that writes `site.css` and `site.css.gz` beside
@@ -42,6 +40,9 @@
 //     which a server must answer with a 406 rather than the plain
 //     file.
 
+use std.list
+use std.str
+
 // A content coding this package will serve, given a sibling file.
 pub enum StaticCoding
     // The file itself.
@@ -76,7 +77,7 @@ pub struct StaticEncodings
 //     println("${staticenc.none_available().has_gzip}")
 // ```
 pub fn none_available() -> StaticEncodings []
-    todo("static-nv.staticenc.none_available")
+    available(false, false, false)
 
 // The siblings a caller found, with the conventional preference.
 //
@@ -87,7 +88,11 @@ pub fn none_available() -> StaticEncodings []
 //     println("${staticenc.available(true, true, false).has_brotli}")
 // ```
 pub fn available(brotli: Bool, gzip: Bool, zstd: Bool) -> StaticEncodings []
-    todo("static-nv.staticenc.available")
+    StaticEncodings {
+        has_brotli: brotli,
+        has_gzip: gzip,
+        has_zstd: zstd,
+        preference: [StaticBrotli, StaticZstd, StaticGzip] }
 
 // The same, with a preference order the deployment chose.
 //
@@ -103,9 +108,76 @@ pub fn available(brotli: Bool, gzip: Bool, zstd: Bool) -> StaticEncodings []
 //     println("${e.has_gzip}")
 // ```
 pub fn with_preference(e: StaticEncodings, order: [StaticCoding]) -> StaticEncodings []
-    todo("static-nv.staticenc.with_preference")
+    StaticEncodings {
+        has_brotli: e.has_brotli,
+        has_gzip: e.has_gzip,
+        has_zstd: e.has_zstd,
+        preference: order }
 
 // ── The header ───────────────────────────────────────────────────────
+
+// Whether the deployment has the sibling a coding needs.  Identity is
+// always available: it is the file itself.
+fn present(c: StaticCoding, e: StaticEncodings) -> Bool
+    match c
+        StaticIdentity => true
+        StaticGzip     => e.has_gzip
+        StaticBrotli   => e.has_brotli
+        StaticZstd     => e.has_zstd
+
+// The coding name of one `Accept-Encoding` item, with any parameters
+// dropped: the name of `gzip;q=0.5` is `gzip`.
+fn item_name(item: Str) -> Str
+    let parts = str.split(item, ";")
+    let head = list.get(parts, 0, "")
+    str.trim(head)
+
+// Thousandths from a `q=` weight written as a decimal, so `0.5` is 500
+// and `1` is 1000.  A weight that is not a decimal answers -1.
+fn q_weight(text: Str) -> Int
+    if text == ""
+        return -1
+    let parts = str.split(text, ".")
+    let head = list.get(parts, 0, "")
+    let whole = str.to_int(head) ?? 0
+    if whole < 0
+        return -1
+    let frac = list.get(parts, 1, "")
+    var thousand = 0
+    if frac != ""
+        let digits = str.slice(frac, 0, 3)
+        var i = 0
+        while i < str.len(digits)
+            let b = str.byte_at_or(digits, i, 0)
+            if b < '0' or b > '9'
+                return -1
+            thousand = thousand * 10 + (b - '0')
+            i = i + 1
+        var pad = 3 - str.len(digits)
+        while pad > 0
+            thousand = thousand * 10
+            pad = pad - 1
+    let total = whole * 1000 + thousand
+    if total > 1000
+        return 1000
+    total
+
+// The weight of one item, in thousandths.  An item carrying no
+// q-value weighs 1000; one carrying a q-value that is not a number
+// weighs 0, because a weight that cannot be read is not a permission.
+fn item_quality(item: Str) -> Int
+    let parts = str.split(item, ";")
+    var out = 1000
+    for p in parts
+        let t = str.lower(str.trim(p))
+        if str.starts_with(t, "q=")
+            let v = str.slice(t, 2, str.len(t))
+            let q = q_weight(v)
+            if q < 0
+                out = 0
+            else
+                out = q
+    out
 
 // The coding to serve, given an `Accept-Encoding` header and what is
 // available.
@@ -129,7 +201,14 @@ pub fn with_preference(e: StaticEncodings, order: [StaticCoding]) -> StaticEncod
 //         None    => println("406 — nothing on offer is acceptable")
 // ```
 pub fn choose(accept_encoding: Str, e: StaticEncodings) -> ?StaticCoding []
-    todo("static-nv.staticenc.choose")
+    if str.trim(accept_encoding) == ""
+        return Some(StaticIdentity)
+    for c in e.preference
+        if present(c, e) and quality_of(accept_encoding, coding_name(c)) > 0
+            return Some(c)
+    if identity_refused(accept_encoding)
+        return None
+    Some(StaticIdentity)
 
 // The quality a header assigns a named coding, in thousandths.
 //
@@ -146,7 +225,19 @@ pub fn choose(accept_encoding: Str, e: StaticEncodings) -> ?StaticCoding []
 //     println("${staticenc.quality_of("gzip;q=0.5, *;q=0", "gzip")}")
 // ```
 pub fn quality_of(accept_encoding: Str, coding: Str) -> Int []
-    todo("static-nv.staticenc.quality_of")
+    let items = str.split(accept_encoding, ",")
+    let want = str.lower(coding)
+    var found = -1
+    var star = -1
+    for item in items
+        let name = item_name(item)
+        if name == "*"
+            star = item_quality(item)
+        if str.lower(name) == want
+            found = item_quality(item)
+    if found >= 0
+        return found
+    star
 
 // Whether a header forbids the uncompressed file.
 //
@@ -164,7 +255,7 @@ pub fn quality_of(accept_encoding: Str, coding: Str) -> Int []
 //     println("${staticenc.identity_refused("gzip")}")
 // ```
 pub fn identity_refused(accept_encoding: Str) -> Bool []
-    todo("static-nv.staticenc.identity_refused")
+    quality_of(accept_encoding, "identity") == 0
 
 // Whether a coding was explicitly refused with `q=0`.
 //
@@ -179,7 +270,7 @@ pub fn identity_refused(accept_encoding: Str) -> Bool []
 //     println("${staticenc.is_refused("gzip;q=0, br", "gzip")}")
 // ```
 pub fn is_refused(accept_encoding: Str, coding: Str) -> Bool []
-    todo("static-nv.staticenc.is_refused")
+    quality_of(accept_encoding, coding) == 0
 
 // ── Naming ───────────────────────────────────────────────────────────
 
@@ -198,7 +289,11 @@ pub fn is_refused(accept_encoding: Str, coding: Str) -> Bool []
 //     println(staticenc.coding_name(staticenc.StaticBrotli))
 // ```
 pub fn coding_name(c: StaticCoding) -> Str []
-    todo("static-nv.staticenc.coding_name")
+    match c
+        StaticIdentity => ""
+        StaticGzip     => "gzip"
+        StaticBrotli   => "br"
+        StaticZstd     => "zstd"
 
 // The filename suffix for a coding: `.gz`, `.br`, `.zst`, or empty.
 //
@@ -209,7 +304,11 @@ pub fn coding_name(c: StaticCoding) -> Str []
 //     println(staticenc.coding_suffix(staticenc.StaticGzip))
 // ```
 pub fn coding_suffix(c: StaticCoding) -> Str []
-    todo("static-nv.staticenc.coding_suffix")
+    match c
+        StaticIdentity => ""
+        StaticGzip     => ".gz"
+        StaticBrotli   => ".br"
+        StaticZstd     => ".zst"
 
 // The sibling path for a relative path and a coding.
 //
@@ -227,7 +326,11 @@ pub fn coding_suffix(c: StaticCoding) -> Str []
 //     println(staticenc.sibling_path("css/site.css", staticenc.StaticGzip))
 // ```
 pub fn sibling_path(relative: Str, c: StaticCoding) -> Str []
-    todo("static-nv.staticenc.sibling_path")
+    let suffix = coding_suffix(c)
+    if suffix == ""
+        return relative
+    let joined = relative + suffix
+    joined
 
 // The coding a filename's suffix names, or identity.
 //
@@ -241,7 +344,13 @@ pub fn sibling_path(relative: Str, c: StaticCoding) -> Str []
 //     println(staticenc.coding_of_path("css/site.css.br") == staticenc.StaticBrotli)
 // ```
 pub fn coding_of_path(path: Str) -> StaticCoding []
-    todo("static-nv.staticenc.coding_of_path")
+    if str.ends_with(path, ".gz")
+        return StaticGzip
+    if str.ends_with(path, ".br")
+        return StaticBrotli
+    if str.ends_with(path, ".zst")
+        return StaticZstd
+    StaticIdentity
 
 // The `Vary` header every response from a negotiating server carries.
 //
@@ -259,7 +368,7 @@ pub fn coding_of_path(path: Str) -> StaticCoding []
 //     println(staticenc.vary_header())
 // ```
 pub fn vary_header() -> Str []
-    todo("static-nv.staticenc.vary_header")
+    "Accept-Encoding"
 
 // The status for a client that refused everything: 406.
 //
@@ -270,7 +379,7 @@ pub fn vary_header() -> Str []
 //     println("${staticenc.not_acceptable_status()}")
 // ```
 pub fn not_acceptable_status() -> Int []
-    todo("static-nv.staticenc.not_acceptable_status")
+    406
 
 // Whether a media type is worth compressing at all.
 //
@@ -287,7 +396,14 @@ pub fn not_acceptable_status() -> Int []
 //     println("${staticenc.worth_compressing("image/png")}")
 // ```
 pub fn worth_compressing(content_type: Str) -> Bool []
-    todo("static-nv.staticenc.worth_compressing")
+    if str.starts_with(content_type, "text/")
+        return true
+    if str.ends_with(content_type, "+xml") or str.ends_with(content_type, "+json")
+        return true
+    let compressible = ["application/json", "application/javascript",
+                        "application/xml", "application/wasm",
+                        "application/x-ndjson", "application/manifest+json"]
+    list.contains(compressible, content_type)
 
 // The codecs a `.gz`, `.br` or `.zst` sibling was produced with, named
 // so a reader knows what this package is NOT doing.
@@ -304,4 +420,4 @@ pub fn worth_compressing(content_type: Str) -> Bool []
 //     println("${list.len(staticenc.producing_packages())}")
 // ```
 pub fn producing_packages() -> [Str] []
-    todo("static-nv.staticenc.producing_packages")
+    ["flate-nv", "brotli-nv", "zstd-nv"]

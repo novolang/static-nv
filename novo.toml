@@ -1,15 +1,10 @@
 [package]
 name        = "static-nv"
-version     = "0.0.2"
-description = "Static files over HTTP: a path resolver that cannot escape its root and performs nothing while proving it, ETags and conditional requests, byte ranges, precompressed siblings, and cache-control presets.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "Static files over HTTP: a path resolver that cannot escape its root and performs nothing while proving it, ETags and conditional requests, byte ranges, precompressed siblings, and cache-control presets."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
 # `host`, and the split inside it is the security argument.
 #
@@ -38,7 +33,7 @@ category    = "web"
 tags        = ["static", "http", "file-server", "etag", "range-requests", "cache-control", "tower-http", "whitenoise"]
 repository  = "https://github.com/novolang/static-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -54,15 +49,17 @@ novo        = ">= 0.8.9"
 # format to write and THREE to accept — and a conditional request whose
 # date this package cannot read is a 200 with a whole file in it where
 # a 304 would do.
-calendar-nv = "^0.0.2"
+calendar-nv = "^0.2.1"
 
 # crypto-nv is `hashing.sha256`, which is what a strong `ETag` is here.
-# The reason it is a content hash rather than size-and-mtime is in the
-# README: the standard library answers no modification time, so
-# size-and-mtime is not a validator this package could compute even if
-# it wanted one.  `digest.ct_eq` is not used — an ETag comparison is
-# not a secret comparison.
-crypto-nv   = "^0.1.1"
+# The reason it is a content hash rather than size-and-mtime: a
+# modification time is a WEAK validator, it changes when a file is
+# touched rather than when its bytes change, and a weak tag cannot
+# answer `If-Range`.  `staticmeta` is `[]` besides, so it can hash the
+# bytes a caller hands it and cannot read a clock or a disk at all.
+# `digest.ct_eq` is not used — an ETag comparison is not a secret
+# comparison.
+crypto-nv   = "^0.1.7"
 
 # mime-nv is `Content-Type`, and the reason it is not `path.ext` plus a
 # table is `mimesniff.sniff_with`: a `.txt` whose first bytes are a
@@ -70,7 +67,7 @@ crypto-nv   = "^0.1.1"
 # unless `X-Content-Type-Options: nosniff` is set.  A static file
 # server is the one program that can and should set that header, and
 # mime-nv is where the rule about when it matters lives.
-mime-nv     = "^0.0.1"
+mime-nv     = "^0.1.1"
 
 # NOT flate-nv and NOT brotli-nv, and the absence is the design.  This
 # package does not compress: it SERVES a `.gz` or `.br` sibling the

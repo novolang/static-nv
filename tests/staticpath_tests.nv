@@ -1,8 +1,5 @@
 // staticpath_tests.nv — the traversal rules, as a table.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: static-nv.staticpath.<fn>`.
-//
 // **THIS FILE IS THE SECURITY ARGUMENT.**  Path traversal is the oldest
 // vulnerability a file server has, and the way it survives is that the
 // rules get checked against a filesystem: a suite covers the ten

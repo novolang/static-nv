@@ -1,9 +1,6 @@
 // staticmeta_tests.nv — the validators, and RFC 9110 § 13.2.2's
 // precedence in full.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: static-nv.staticmeta.<fn>`.
-//
 // THE PRECEDENCE TABLE IS THE POINT OF THIS FILE.  Five conditional
 // headers, one order, and one rule — `If-None-Match` overrides
 // `If-Modified-Since` — that implementations skip and that costs a

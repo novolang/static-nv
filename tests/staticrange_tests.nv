@@ -1,9 +1,6 @@
 // staticrange_tests.nv — the four ways answering a `Range` goes
 // wrong.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: static-nv.staticrange.<fn>`.
-//
 // A range request is the one place in a static file server where a
 // CLIENT controls arithmetic the SERVER performs.  Every case below is
 // a literal string and a literal size.

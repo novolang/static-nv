@@ -1,9 +1,6 @@
 // staticfs_tests.nv — the half that reads a disk, and the containment
 // claim it does NOT make.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: static-nv.staticfs.<fn>`.
-//
 // THE EFFECT ROWS ARE PART OF THE ASSERTION.  The tests that touch a
 // filesystem declare `[io, fs]` and no more — no `[net]`, because this
 // package answers a value rather than writing a socket, and no extra

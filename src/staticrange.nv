@@ -1,8 +1,6 @@
 // staticrange.nv — `Range`, and the four ways answering one goes
 // wrong.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A RANGE REQUEST IS HOW A VIDEO SCRUBS AND HOW A DOWNLOAD RESUMES,
 // and it is the one part of a static file server where a client
 // controls arithmetic the server performs.  Four things go wrong, and
@@ -42,6 +40,8 @@
 // client that resumes its own downloads — would be the reason to move
 // these four into a shared package, and the README names that.
 
+use std.list
+use std.str
 use staticerr
 
 // One byte range, resolved against a known size.
@@ -80,7 +80,7 @@ pub struct StaticRangeLimits
 //     println("${staticrange.default_limits().max_ranges}")
 // ```
 pub fn default_limits() -> StaticRangeLimits []
-    todo("static-nv.staticrange.default_limits")
+    limits(4, 150)
 
 // Limits a caller chose.
 //
@@ -91,7 +91,71 @@ pub fn default_limits() -> StaticRangeLimits []
 //     println("${staticrange.limits(1, 100).max_ranges}")
 // ```
 pub fn limits(max_ranges: Int, max_total_percent: Int) -> StaticRangeLimits []
-    todo("static-nv.staticrange.limits")
+    StaticRangeLimits {
+        max_ranges: max_ranges,
+        max_total_percent: max_total_percent }
+
+// Whether a token is one or more decimal digits.  `bytes=+1-2` and
+// `bytes=` are not ranges, and a parser that read them as numbers
+// would answer a request nobody wrote.
+fn is_number(token: Str) -> Bool
+    if token == ""
+        return false
+    var i = 0
+    while i < str.len(token)
+        let b = str.byte_at_or(token, i, 0)
+        if b < '0' or b > '9'
+            return false
+        i = i + 1
+    true
+
+// One item against § 14.1.1's three productions: a closed
+// `first-last`, an open `first-`, or a suffix `-n`.
+fn item_is_well_formed(item: Str) -> Bool
+    if str.starts_with(item, "-")
+        return is_number(str.slice(item, 1, str.len(item)))
+    let at = str.index(item, "-")
+    match at
+        None    => false
+        Some(i) =>
+            let left = str.slice(item, 0, i)
+            if not is_number(left)
+                return false
+            let right = str.slice(item, i + 1, str.len(item))
+            if right == ""
+                return true
+            is_number(right)
+
+// Whether every item is one of the three forms.  A set with one item
+// that is none of them is refused rather than half-answered, because
+// the alternative is a 206 for a request this package did not read.
+fn items_are_well_formed(items: [Str]) -> Bool
+    for item in items
+        if not item_is_well_formed(str.trim(item))
+            return false
+    true
+
+// The first byte an item named, which is what a 416 reports.  A suffix
+// names no first byte, so it answers 0.
+fn item_first(item: Str) -> Int
+    if str.starts_with(item, "-")
+        return 0
+    let at = str.index(item, "-") ?? 0
+    str.to_int(str.slice(item, 0, at)) ?? 0
+
+// One item of a range set, resolved against a size: `Some` where the
+// file can answer it, `None` where every byte it named is outside it.
+fn item_range(item: Str, size: Int) -> ?StaticRange
+    if str.starts_with(item, "-")
+        let n = str.to_int(str.slice(item, 1, str.len(item))) ?? 0
+        return resolve_suffix(n, size)
+    let at = str.index(item, "-") ?? 0
+    let first = str.to_int(str.slice(item, 0, at)) ?? 0
+    let right = str.slice(item, at + 1, str.len(item))
+    if right == ""
+        return resolve_open(first, size)
+    let last = str.to_int(right) ?? 0
+    resolve_closed(first, last, size)
 
 // A `Range` header, resolved against a size.
 //
@@ -118,7 +182,31 @@ pub fn limits(max_ranges: Int, max_total_percent: Int) -> StaticRangeLimits []
 // ```
 pub fn parse(header: Str, size: Int,
              lim: StaticRangeLimits) -> Result<[StaticRange], staticerr.StaticFault> []
-    todo("static-nv.staticrange.parse")
+    if not is_byte_range(header)
+        return Ok([])
+    let spec = str.slice(header, 6, str.len(header))
+    let items = str.split(spec, ",")
+    if list.len(items) > lim.max_ranges
+        return Err(staticerr.StaticRangeRefused("more ranges in one request than the limit allows"))
+    if not items_are_well_formed(items)
+        return Err(staticerr.StaticRangeRefused("a range that is not one of the three forms"))
+    var out: [StaticRange] = []
+    var missed = false
+    var first_named = 0
+    for item in items
+        let t = str.trim(item)
+        match item_range(t, size)
+            Some(g) =>
+                out = list.push(out, g)
+            None    =>
+                if not missed
+                    first_named = item_first(t)
+                    missed = true
+    if list.len(out) == 0
+        return Err(staticerr.StaticRangeUnsatisfiable(first_named, size))
+    if total_bytes(out) * 100 > lim.max_total_percent * size
+        return Err(staticerr.StaticRangeRefused("the ranges total more than the ceiling allows"))
+    Ok(out)
 
 // Whether a header is a range request this package will look at.
 //
@@ -133,7 +221,10 @@ pub fn parse(header: Str, size: Int,
 //     println("${staticrange.is_byte_range("bytes=0-99")}")
 // ```
 pub fn is_byte_range(header: Str) -> Bool []
-    todo("static-nv.staticrange.is_byte_range")
+    if str.len(header) < 6
+        return false
+    let head = str.slice(header, 0, 6)
+    str.lower(head) == "bytes="
 
 // How many bytes a set of ranges totals.
 //
@@ -151,7 +242,10 @@ pub fn is_byte_range(header: Str) -> Bool []
 //         Ok(rs) => println("${staticrange.total_bytes(rs)}")
 // ```
 pub fn total_bytes(rs: [StaticRange]) -> Int []
-    todo("static-nv.staticrange.total_bytes")
+    var total = 0
+    for r in rs
+        total = total + range_len(r)
+    total
 
 // The length of one range, in bytes.
 //
@@ -166,7 +260,7 @@ pub fn total_bytes(rs: [StaticRange]) -> Int []
 //     println("${staticrange.range_len(StaticRange { first: 0, last: 0 })}")
 // ```
 pub fn range_len(r: StaticRange) -> Int []
-    todo("static-nv.staticrange.range_len")
+    r.last - r.first + 1
 
 // The `Content-Range` header for a single-range 206.
 //
@@ -180,7 +274,10 @@ pub fn range_len(r: StaticRange) -> Int []
 //     println(staticrange.content_range(StaticRange { first: 0, last: 499 }, 10000))
 // ```
 pub fn content_range(r: StaticRange, size: Int) -> Str []
-    todo("static-nv.staticrange.content_range")
+    let head = "bytes " + str.from_int(r.first)
+    let span = head + "-" + str.from_int(r.last)
+    let tail = span + "/" + str.from_int(size)
+    tail
 
 // The `Content-Range` header for a 416: `bytes * /10000`.
 //
@@ -195,7 +292,8 @@ pub fn content_range(r: StaticRange, size: Int) -> Str []
 //     println(staticrange.unsatisfiable_header(10000))
 // ```
 pub fn unsatisfiable_header(size: Int) -> Str []
-    todo("static-nv.staticrange.unsatisfiable_header")
+    let out = "bytes */" + str.from_int(size)
+    out
 
 // The `Accept-Ranges: bytes` header, which says range requests work.
 //
@@ -211,7 +309,7 @@ pub fn unsatisfiable_header(size: Int) -> Str []
 //     println(staticrange.accept_ranges())
 // ```
 pub fn accept_ranges() -> Str []
-    todo("static-nv.staticrange.accept_ranges")
+    "bytes"
 
 // ── Multipart ────────────────────────────────────────────────────────
 
@@ -229,7 +327,9 @@ pub fn accept_ranges() -> Str []
 //     println(staticrange.multipart_type("NOVOBOUNDARY1234"))
 // ```
 pub fn multipart_type(boundary: Str) -> Str []
-    todo("static-nv.staticrange.multipart_type")
+    let prefix = "multipart/byteranges; boundary="
+    let out = prefix + boundary
+    out
 
 // The header block before one part of a multipart response.
 //
@@ -246,7 +346,11 @@ pub fn multipart_type(boundary: Str) -> Str []
 //     println(staticrange.part_header("B", "text/plain", r, 10000))
 // ```
 pub fn part_header(boundary: Str, content_type: Str, r: StaticRange, size: Int) -> Str []
-    todo("static-nv.staticrange.part_header")
+    let open = "--" + boundary + "\r\n"
+    let typed = open + "Content-Type: " + content_type + "\r\n"
+    let ranged = typed + "Content-Range: " + content_range(r, size) + "\r\n"
+    let blank = ranged + "\r\n"
+    blank
 
 // The closing delimiter of a multipart response: `--boundary--`.
 //
@@ -257,7 +361,8 @@ pub fn part_header(boundary: Str, content_type: Str, r: StaticRange, size: Int) 
 //     println(staticrange.multipart_end("B"))
 // ```
 pub fn multipart_end(boundary: Str) -> Str []
-    todo("static-nv.staticrange.multipart_end")
+    let out = "--" + boundary + "--\r\n"
+    out
 
 // How many bytes a multipart response will be, given the ranges and
 // the boundary.
@@ -278,7 +383,11 @@ pub fn multipart_end(boundary: Str) -> Str []
 //         Ok(rs) => println("${staticrange.multipart_len(rs, "B", "text/plain", 100)}")
 // ```
 pub fn multipart_len(rs: [StaticRange], boundary: Str, content_type: Str, size: Int) -> Int []
-    todo("static-nv.staticrange.multipart_len")
+    var total = 0
+    for r in rs
+        total = total + str.len(part_header(boundary, content_type, r, size))
+        total = total + range_len(r)
+    total + str.len(multipart_end(boundary))
 
 // ── The three parse cases, individually ──────────────────────────────
 //
@@ -301,7 +410,16 @@ pub fn multipart_len(rs: [StaticRange], boundary: Str, content_type: Str, size: 
 //         None    => println("unsatisfiable")
 // ```
 pub fn resolve_closed(first: Int, last: Int, size: Int) -> ?StaticRange []
-    todo("static-nv.staticrange.resolve_closed")
+    if size <= 0
+        return None
+    if first < 0 or first >= size
+        return None
+    if last < first
+        return None
+    var l = last
+    if l > size - 1
+        l = size - 1
+    Some(StaticRange { first: first, last: l })
 
 // A range written `first-`, meaning "from here to the end".
 //
@@ -316,7 +434,11 @@ pub fn resolve_closed(first: Int, last: Int, size: Int) -> ?StaticRange []
 //         None    => println("unsatisfiable")
 // ```
 pub fn resolve_open(first: Int, size: Int) -> ?StaticRange []
-    todo("static-nv.staticrange.resolve_open")
+    if size <= 0
+        return None
+    if first < 0 or first >= size
+        return None
+    Some(StaticRange { first: first, last: size - 1 })
 
 // A range written `-n`, meaning THE LAST `n` BYTES.
 //
@@ -336,7 +458,13 @@ pub fn resolve_open(first: Int, size: Int) -> ?StaticRange []
 //         None    => println("unsatisfiable")
 // ```
 pub fn resolve_suffix(suffix_len: Int, size: Int) -> ?StaticRange []
-    todo("static-nv.staticrange.resolve_suffix")
+    if size <= 0
+        return None
+    if suffix_len <= 0
+        return None
+    if suffix_len >= size
+        return Some(StaticRange { first: 0, last: size - 1 })
+    Some(StaticRange { first: size - suffix_len, last: size - 1 })
 
 // Whether a zero-length file can answer any range at all.
 //
@@ -352,4 +480,4 @@ pub fn resolve_suffix(suffix_len: Int, size: Int) -> ?StaticRange []
 //     println("${staticrange.any_satisfiable(0)}")
 // ```
 pub fn any_satisfiable(size: Int) -> Bool []
-    todo("static-nv.staticrange.any_satisfiable")
+    size > 0

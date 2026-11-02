@@ -1,7 +1,5 @@
 // staticfs.nv — the half that reads a disk.  `[fs]`, and nothing else.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[fs]` AND NOT `[io]`.  A library does not print, so nothing here
 // writes a line; and not `[net]`, because this package answers a
 // VALUE and the caller's server writes it to a socket.  That keeps a
@@ -28,19 +26,25 @@
 // CONTAINMENT IS LEXICAL, AND THIS PACKAGE SAYS SO RATHER THAN
 // PRETENDING.  `staticpath` proves that the path it built is inside
 // the root AS A STRING — every segment checked, no traversal, no
-// encoded separator.  It cannot prove that `root/uploads/x` is not a
-// symbolic link to `/etc/shadow`, because that question is the
-// filesystem's, and **the standard library answers no symbolic-link
-// question at all**: no `realpath`, no `readlink`, no link flag on any
-// metadata call.  So `staticfs` cannot run the second check either.
+// encoded separator.  It does not prove that `root/uploads/x` is not a
+// symbolic link to `/etc/shadow`: that question is the filesystem's,
+// and this package asks it nowhere.  The standard library CAN answer
+// it — `realpath`, `is_symlink` and `read_link` are all there — and
+// the answer is left to the deployment, because the question that
+// matters is "can a stranger put a link in this root", which a library
+// is not in a position to know.
 //
 // `containment_is_lexical_only` is published for exactly this, and it
-// answers `true` today.  A root a deployment controls end to end is
-// safe; a root that accepts uploads and follows links is not.  The gap
-// is filed against the standard library rather than papered over, and
-// the day a `realpath` lands this function's answer changes and
-// nothing else in the surface does.
+// answers `true`.  A root a deployment controls end to end is safe; a
+// root that accepts uploads, or that a person can put links in, is
+// not.  A deployment in that position calls `fs.is_symlink` on the
+// path before it serves it, or holds its files somewhere a symbolic
+// link cannot be created.
 
+use std.bytes
+use std.fs
+use std.list
+use std.str
 use civil
 use staticenc
 use staticerr
@@ -73,11 +77,11 @@ pub struct StaticIndex
     // What compressed siblings exist, one per entry, in the same
     // order.
     encodings: [staticenc.StaticEncodings]
-    // When the scan ran.  This is what `Last-Modified` is emitted from
-    // when a caller asks for it: not each file's own modification time
-    // — the standard library has no such call — but the moment the
-    // deployment read them.  Honest, coarse, and enough to make a
-    // conditional request work within one deploy.
+    // When the scan ran, where the caller stamped it.  A deployment
+    // that emits `Last-Modified` from this gets a coarse validator that
+    // changes on every deploy; each entry carries its own file's
+    // modification time as well, and that one is the better choice.
+    // `scan` leaves this absent and `scan_at` fills it.
     scanned_at: ?civil.CivilDateTime
 
 // Everything a response needs, as a value the caller writes.
@@ -105,7 +109,11 @@ pub struct StaticServed
 //     println(staticfs.root("/srv/site").path)
 // ```
 pub fn root(path: Str) -> StaticRoot []
-    todo("static-nv.staticfs.root")
+    StaticRoot {
+        path: path,
+        policy: staticpath.defaults(),
+        ranges: staticrange.default_limits(),
+        negotiate_encoding: true }
 
 // The same root with a path policy the caller chose.
 //
@@ -119,7 +127,11 @@ pub fn root(path: Str) -> StaticRoot []
 //     println("${r.policy.list_directories}")
 // ```
 pub fn with_policy(r: StaticRoot, p: staticpath.StaticPolicy) -> StaticRoot []
-    todo("static-nv.staticfs.with_policy")
+    StaticRoot {
+        path: r.path,
+        policy: p,
+        ranges: r.ranges,
+        negotiate_encoding: r.negotiate_encoding }
 
 // The same root with range limits the caller chose.
 //
@@ -132,12 +144,16 @@ pub fn with_policy(r: StaticRoot, p: staticpath.StaticPolicy) -> StaticRoot []
 //     println("${r.ranges.max_ranges}")
 // ```
 pub fn with_ranges(r: StaticRoot, lim: staticrange.StaticRangeLimits) -> StaticRoot []
-    todo("static-nv.staticfs.with_ranges")
+    StaticRoot {
+        path: r.path,
+        policy: r.policy,
+        ranges: lim,
+        negotiate_encoding: r.negotiate_encoding }
 
 // The same root, ignoring precompressed siblings.
 //
 // For a root where the build wrote none, so no request pays for the
-// two `exists` calls that look for them.
+// three calls that look for them.
 //
 // ```novo
 // use staticfs
@@ -146,9 +162,180 @@ pub fn with_ranges(r: StaticRoot, lim: staticrange.StaticRangeLimits) -> StaticR
 //     println("${staticfs.without_encoding(staticfs.root("/srv/site")).negotiate_encoding}")
 // ```
 pub fn without_encoding(r: StaticRoot) -> StaticRoot []
-    todo("static-nv.staticfs.without_encoding")
+    StaticRoot {
+        path: r.path,
+        policy: r.policy,
+        ranges: r.ranges,
+        negotiate_encoding: false }
 
 // ── The index ────────────────────────────────────────────────────────
+
+// How many segments a relative path has: the empty path, which is the
+// root itself, has none.  It is also the index a segment is checked
+// under, which is why a count is what is wanted here and not a list.
+fn depth_of(relative: Str) -> Int
+    if relative == ""
+        return 0
+    let parts = str.split(relative, "/")
+    list.len(parts)
+
+// A child of a relative directory: `name` under `relative`, with no
+// doubled separator when `relative` is the root.  The one place the
+// walk builds a relative path, so an index's keys have one shape.
+fn below(relative: Str, name: Str) -> Str
+    if relative == ""
+        return name
+    let out = relative + "/" + name
+    out
+
+// Whether a name the walk found may go in the index.  The same segment
+// rule the serving path checks a request against, asked once at scan
+// time.  A refused name is skipped rather than failing the walk: a
+// `.env` in the root is a reason to hide one file and not to refuse
+// the site.
+fn name_is_allowed(r: StaticRoot, name: Str, index: Int) -> Bool
+    let refused = staticpath.check_segment(name, index, r.policy)
+    match refused
+        None    => true
+        Some(_) => false
+
+// Whether the root is a directory now.  Asked at the top of a scan and
+// at the top of a live request: a root that was deleted should be a
+// fault somebody is paged about rather than a 404 for every path.
+fn root_is_there(r: StaticRoot) -> Bool [fs]
+    fs.is_dir(r.path)
+
+// A clock time from three integers, `None` where `civil` refuses one.
+// A wrapper, because `civil.time_of` answers a `Result` and a
+// modification time that a filesystem answered oddly is not a reason
+// to fail a whole scan.
+fn clock_time(hour: Int, minute: Int, second: Int) -> ?civil.CivilTime
+    let made = civil.time_of(hour, minute, second, 0)
+    match made
+        Ok(t)  => Some(t)
+        // cov: skip — the three arguments are in range by construction
+        Err(_) => None
+
+// A civil date-time from epoch seconds, which is what `fs.file_mtime`
+// answers.  The division floors rather than truncates, so a time from
+// before 1970 lands on the right day, and the second within that day
+// is the remainder.
+fn from_epoch_seconds(seconds: Int) -> civil.CivilDateTime
+    var day = seconds / 86400
+    var within = seconds % 86400
+    if within < 0
+        day = day - 1
+        within = within + 86400
+    let clock = clock_time(within / 3600, within % 3600 / 60, within % 60)
+    let clock_value = clock ?? civil.midnight()
+    civil.datetime(civil.date_from_epoch_day(day), clock_value)
+
+// An entry with its modification time, read from the file itself.
+// Absent where the filesystem answers no time, which leaves the entry
+// as complete as it was before the call.
+fn dated(e: staticmeta.StaticEntry, path: Str) -> staticmeta.StaticEntry [fs]
+    let seconds = fs.file_mtime(path)
+    match seconds
+        Some(s) => staticmeta.with_modified(e, from_epoch_seconds(s))
+        // cov: skip — a file read a moment ago has a time
+        None    => e
+
+// A file's bytes, read whole.
+//
+// The `is_file` is not decoration.  `fs.read_bytes` on a directory
+// aborts the process with a huge allocation instead of answering
+// `None`, and a directory named after a file is something a stranger
+// who can write into a root can create.  Asking first costs one `stat`
+// per file at scan time and is what keeps a request from killing the
+// server.
+fn read_file_bytes(path: Str) -> Result<Bytes, staticerr.StaticFault> [fs]
+    if not fs.is_file(path)
+        return Err(staticerr.StaticFileUnreadable(path, "not a regular file"))
+    let content = fs.read_bytes(path)
+    let Some(raw) = content else
+        return Err(staticerr.StaticFileUnreadable(path, "the file could not be read"))
+    Ok(raw)
+
+// One file's entry: a full read, because the content hash is the ETag,
+// and the media type from the name.  A file that vanished between the
+// walk and the read fails the scan rather than being dropped, because
+// a silently smaller index is one a deployment believes in.
+fn entry_for(r: StaticRoot,
+             relative: Str) -> Result<staticmeta.StaticEntry, staticerr.StaticFault> [fs]
+    let on_disk = staticpath.join_root(r.path, relative)
+    let raw = read_file_bytes(on_disk)!
+    let e = staticmeta.entry(relative, raw)
+    Ok(dated(e, on_disk))
+
+// Every file's entry, in the order the walk found the paths.
+fn entries_for(r: StaticRoot,
+               paths: [Str]) -> Result<[staticmeta.StaticEntry], staticerr.StaticFault> [fs]
+    var out: [staticmeta.StaticEntry] = []
+    for p in paths
+        let one = entry_for(r, p)!
+        out = list.push(out, one)
+    Ok(out)
+
+// Every path under a relative directory, appended to `out`.
+//
+// A name the policy refuses is skipped, and so is a path deeper than
+// the policy's ceiling: the index holds exactly what the serving path
+// would serve, so a request for anything in it cannot be refused.  The
+// ceiling is also what bounds a walk that followed a symbolic link
+// into a cycle.  A name that is neither a file nor a directory — a
+// socket or a pipe — is skipped rather than indexed.
+fn walk(r: StaticRoot, relative: Str, var out: [Str]) [fs]
+    let depth = depth_of(relative)
+    let on_disk = staticpath.join_root(r.path, relative)
+    let names = fs.read_dir(on_disk)
+    for name in names
+        let child = below(relative, name)
+        if not name_is_allowed(r, name, depth) or depth + 1 > r.policy.max_segments
+            continue
+        let kind = kind_of(r, child)
+        if kind == staticpath.kind_directory()
+            walk(r, child, out)
+        else if kind == staticpath.kind_file()
+            list.push(out, child)
+
+// What a caller's three answers mean for this root, with the root's
+// own switch applied.  The one place `negotiate_encoding` is consulted
+// about the index, so an indexed and a live answer agree about a root
+// that turned it off.
+fn siblings_from(r: StaticRoot, brotli: Bool, gzip: Bool, zstd: Bool) -> staticenc.StaticEncodings
+    if not r.negotiate_encoding
+        return staticenc.none_available()
+    staticenc.available(brotli, gzip, zstd)
+
+// One `StaticEncodings` per path, in the same order as the entries.
+// Membership is answered from the same sorted walk, so an index can
+// never report a sibling it did not itself see.
+fn encodings_for(r: StaticRoot, paths: [Str]) -> [staticenc.StaticEncodings]
+    var out: [staticenc.StaticEncodings] = []
+    for p in paths
+        let br = list.contains(paths, staticenc.sibling_path(p, staticenc.StaticBrotli))
+        let gz = list.contains(paths, staticenc.sibling_path(p, staticenc.StaticGzip))
+        let zs = list.contains(paths, staticenc.sibling_path(p, staticenc.StaticZstd))
+        out = list.push(out, siblings_from(r, br, gz, zs))
+    out
+
+// The index itself: the walk, its sort, an entry per path, and the
+// encodings that line up with those entries.  The sort comes first,
+// because both lists are built from the sorted paths and that is what
+// makes them parallel by construction.
+fn build(r: StaticRoot, at: ?civil.CivilDateTime) -> Result<StaticIndex, staticerr.StaticFault> [fs]
+    if not root_is_there(r)
+        return Err(staticerr.StaticRootUnreadable(r.path, "not a directory"))
+    var paths: [Str] = []
+    walk(r, "", paths)
+    paths = list.sort(paths)
+    let entries = entries_for(r, paths)!
+    let encodings = encodings_for(r, paths)
+    Ok(StaticIndex {
+        root: r,
+        entries: entries,
+        encodings: encodings,
+        scanned_at: at })
 
 // Walk a root and build an index: every file's size, hash, media type
 // and siblings.
@@ -172,7 +359,7 @@ pub fn without_encoding(r: StaticRoot) -> StaticRoot []
 //         Err(_) => println("that root is not readable")
 // ```
 pub fn scan(r: StaticRoot) -> Result<StaticIndex, staticerr.StaticFault> [fs]
-    todo("static-nv.staticfs.scan")
+    build(r, None)
 
 // The same scan, stamped with the time the caller read from a clock.
 //
@@ -192,7 +379,7 @@ pub fn scan(r: StaticRoot) -> Result<StaticIndex, staticerr.StaticFault> [fs]
 // ```
 pub fn scan_at(r: StaticRoot,
                at: civil.CivilDateTime) -> Result<StaticIndex, staticerr.StaticFault> [fs]
-    todo("static-nv.staticfs.scan_at")
+    build(r, Some(at))
 
 // How many files an index holds.
 //
@@ -205,7 +392,7 @@ pub fn scan_at(r: StaticRoot,
 //         Ok(ix) => println("${staticfs.index_len(ix)}")
 // ```
 pub fn index_len(ix: StaticIndex) -> Int []
-    todo("static-nv.staticfs.index_len")
+    list.len(ix.entries)
 
 // The entry for a relative path, or `None`.
 //
@@ -225,7 +412,11 @@ pub fn index_len(ix: StaticIndex) -> Int []
 //                 None    => println("not in the index")
 // ```
 pub fn lookup(ix: StaticIndex, relative: Str) -> ?staticmeta.StaticEntry []
-    todo("static-nv.staticfs.lookup")
+    for e in ix.entries
+        let at = e.relative
+        if at == relative
+            return Some(e)
+    None
 
 // The compressed siblings an index found for a relative path.
 //
@@ -238,7 +429,13 @@ pub fn lookup(ix: StaticIndex, relative: Str) -> ?staticmeta.StaticEntry []
 //         Ok(ix) => println("${staticfs.encodings_of(ix, "index.html").has_gzip}")
 // ```
 pub fn encodings_of(ix: StaticIndex, relative: Str) -> staticenc.StaticEncodings []
-    todo("static-nv.staticfs.encodings_of")
+    var i = 0
+    for e in ix.entries
+        let at = e.relative
+        if at == relative
+            return list.get(ix.encodings, i, staticenc.none_available())
+        i = i + 1
+    staticenc.none_available()
 
 // Every relative path in an index, sorted.
 //
@@ -255,15 +452,21 @@ pub fn encodings_of(ix: StaticIndex, relative: Str) -> staticenc.StaticEncodings
 //         Ok(ix) => println("${list.len(staticfs.index_paths(ix))}")
 // ```
 pub fn index_paths(ix: StaticIndex) -> [Str] []
-    todo("static-nv.staticfs.index_paths")
+    var out: [Str] = []
+    for e in ix.entries
+        let at = e.relative
+        out = list.push(out, at)
+    out
 
 // ── Per-request filesystem access ────────────────────────────────────
 
 // What a relative path is on disk: missing, a file, or a directory.
 //
-// The predicate `staticpath.resolve` takes, backed by the filesystem.
 // Answers one of `staticpath.kind_missing`, `kind_file`,
-// `kind_directory`.
+// `kind_directory`.  It is not the predicate `staticpath.resolve`
+// takes: that slot's effect row is `[]`, and a call that reads a disk
+// cannot fill it.  A serving path therefore reaches the same three
+// answers here and makes the same decisions itself, in the same order.
 //
 // ```novo
 // use staticfs
@@ -274,7 +477,12 @@ pub fn index_paths(ix: StaticIndex) -> [Str] []
 //     println("${k == staticpath.kind_file()}")
 // ```
 pub fn kind_of(r: StaticRoot, relative: Str) -> Int [fs]
-    todo("static-nv.staticfs.kind_of")
+    let on_disk = staticpath.join_root(r.path, relative)
+    if fs.is_file(on_disk)
+        return staticpath.kind_file()
+    if fs.is_dir(on_disk)
+        return staticpath.kind_directory()
+    staticpath.kind_missing()
 
 // One file's entry, read from the filesystem now.
 //
@@ -292,11 +500,18 @@ pub fn kind_of(r: StaticRoot, relative: Str) -> Int [fs]
 // ```
 pub fn stat_one(r: StaticRoot,
                 relative: Str) -> Result<staticmeta.StaticEntry, staticerr.StaticFault> [fs]
-    todo("static-nv.staticfs.stat_one")
+    entry_for(r, relative)
+
+// Whether a coding's sibling is a file beside a path, asked now.  A
+// file question rather than an existence question: a directory named
+// `site.css.gz` is not something a request may be answered with.
+fn sibling_is_file(r: StaticRoot, relative: Str, coding: staticenc.StaticCoding) -> Bool [fs]
+    let sibling = staticenc.sibling_path(relative, coding)
+    kind_of(r, sibling) == staticpath.kind_file()
 
 // Which precompressed siblings exist beside a file, asked now.
 //
-// Two `exists` calls where both are enabled — which is why
+// Three lookups where all three codings are enabled — which is why
 // `without_encoding` is worth setting on a root whose build wrote
 // none.
 //
@@ -307,14 +522,18 @@ pub fn stat_one(r: StaticRoot,
 //     println("${staticfs.siblings_of(staticfs.root("/srv/site"), "a.css").has_gzip}")
 // ```
 pub fn siblings_of(r: StaticRoot, relative: Str) -> staticenc.StaticEncodings [fs]
-    todo("static-nv.staticfs.siblings_of")
+    if not r.negotiate_encoding
+        return staticenc.none_available()
+    let br = sibling_is_file(r, relative, staticenc.StaticBrotli)
+    let gz = sibling_is_file(r, relative, staticenc.StaticGzip)
+    let zs = sibling_is_file(r, relative, staticenc.StaticZstd)
+    staticenc.available(br, gz, zs)
 
 // A byte range of a file.
 //
 // A positional read, so serving the last megabyte of a gigabyte file
 // reads a megabyte.  The alternative — reading the file and slicing —
-// is what makes a video server fall over, and it is what the standard
-// library's own static handler does today.
+// is what makes a video server fall over.
 //
 // ```novo
 // use staticfs
@@ -329,7 +548,16 @@ pub fn siblings_of(r: StaticRoot, relative: Str) -> staticenc.StaticEncodings [f
 // ```
 pub fn read_range(r: StaticRoot, relative: Str,
                   span: staticrange.StaticRange) -> Result<Bytes, staticerr.StaticFault> [fs]
-    todo("static-nv.staticfs.read_range")
+    let on_disk = staticpath.join_root(r.path, relative)
+    let opened = fs.open_read(on_disk)
+    let Some(handle) = opened else
+        return Err(staticerr.StaticFileUnreadable(on_disk, "the file could not be opened"))
+    let wanted = staticrange.range_len(span)
+    let chunk = fs.read_at(handle, span.first, wanted)
+    fs.close(handle)
+    let Some(values) = chunk else
+        return Err(staticerr.StaticFileUnreadable(on_disk, "the range could not be read"))
+    Ok(bytes.from_byte_list(values))
 
 // A whole file.
 //
@@ -343,7 +571,8 @@ pub fn read_range(r: StaticRoot, relative: Str,
 //         Err(_) => println("not readable")
 // ```
 pub fn read_all(r: StaticRoot, relative: Str) -> Result<Bytes, staticerr.StaticFault> [fs]
-    todo("static-nv.staticfs.read_all")
+    let on_disk = staticpath.join_root(r.path, relative)
+    read_file_bytes(on_disk)
 
 // The entries of a directory, for a listing.
 //
@@ -360,9 +589,554 @@ pub fn read_all(r: StaticRoot, relative: Str) -> Result<Bytes, staticerr.StaticF
 //         Err(_)    => println("not a directory")
 // ```
 pub fn list_dir(r: StaticRoot, relative: Str) -> Result<[Str], staticerr.StaticFault> [fs]
-    todo("static-nv.staticfs.list_dir")
+    let on_disk = staticpath.join_root(r.path, relative)
+    if not fs.is_dir(on_disk)
+        return Err(staticerr.StaticFileUnreadable(on_disk, "not a directory"))
+    let depth = depth_of(relative)
+    let names = fs.read_dir(on_disk)
+    var dirs: [Str] = []
+    var files: [Str] = []
+    for name in names
+        if not name_is_allowed(r, name, depth)
+            continue
+        let child = below(relative, name)
+        let kind = kind_of(r, child)
+        if kind == staticpath.kind_directory()
+            let shown = name + "/"
+            list.push(dirs, shown)
+        if kind == staticpath.kind_file()
+            list.push(files, name)
+    dirs = list.sort(dirs)
+    files = list.sort(files)
+    var out: [Str] = []
+    for name in dirs
+        list.push(out, name)
+    for name in files
+        list.push(out, name)
+    Ok(out)
 
 // ── Serving ──────────────────────────────────────────────────────────
+
+// An empty byte buffer, named because it is the body of every answer
+// that has none.
+fn no_bytes() -> Bytes
+    bytes.from_byte_list([])
+
+// The headers every answer carries, with whatever that answer adds.
+//
+// `Vary` describes the URL rather than the bytes sent, so a 404 has it
+// as much as a 200: a shared cache that stored the refusal for an
+// identity request would hand it to a client that takes gzip.
+// `nosniff` is what keeps a text file whose bytes are a doctype from
+// running as HTML, and `Accept-Ranges` is what a client reads before
+// it has any reason to send a `Range`.
+fn base_headers(extra: [(Str, Str)]) -> [(Str, Str)]
+    var out: [(Str, Str)] = []
+    out = list.push(out, ("Vary", staticenc.vary_header()))
+    out = list.push(out, ("X-Content-Type-Options", "nosniff"))
+    out = list.push(out, ("Accept-Ranges", staticrange.accept_ranges()))
+    list.append(out, extra)
+    out
+
+// A response with no body: a 404, a 301, a 406.
+fn plain(status: Int, extra: [(Str, Str)], relative: Str) -> StaticServed
+    StaticServed {
+        status: status,
+        headers: base_headers(extra),
+        body: no_bytes(),
+        relative: relative }
+
+// A response whose headers are already assembled and which has no
+// body: a 304 and a 412, which carry validators and nothing else.
+fn bare(status: Int, headers: [(Str, Str)], relative: Str) -> StaticServed
+    StaticServed {
+        status: status,
+        headers: headers,
+        body: no_bytes(),
+        relative: relative }
+
+// The headers of an answer about a file: the validators a conditional
+// request reads, and what the answer itself adds, laid over the three
+// every answer carries.
+fn file_headers(e: staticmeta.StaticEntry, extra: [(Str, Str)]) -> [(Str, Str)]
+    var out: [(Str, Str)] = []
+    let tag = e.etag
+    out = list.push(out, ("ETag", tag))
+    let at = e.modified_at
+    if let Some(stamp) = at
+        let line = staticmeta.format_http_date(stamp)
+        out = list.push(out, ("Last-Modified", line))
+    list.append(out, extra)
+    base_headers(out)
+
+// What a body-carrying answer adds to a file's headers: the media
+// type, the coding where it is not identity, the `Content-Range` a 206
+// names, and the length.  The media type is a parameter because a
+// multipart answer names itself rather than the file.
+fn body_extras(media_type: Str, coding: staticenc.StaticCoding, length: Int,
+               content_range: Str) -> [(Str, Str)]
+    var out: [(Str, Str)] = []
+    if media_type != ""
+        out = list.push(out, ("Content-Type", media_type))
+    let name = staticenc.coding_name(coding)
+    if name != ""
+        out = list.push(out, ("Content-Encoding", name))
+    if content_range != ""
+        out = list.push(out, ("Content-Range", content_range))
+    out = list.push(out, ("Content-Length", str.from_int(length)))
+    out
+
+// The media type of one part of a multipart answer: the entry's own,
+// or the catch-all where the name carries no extension this package
+// knows.  A part header with an empty value is one more thing a client
+// has to tolerate for no reason.
+fn part_type(content_type: Str) -> Str
+    if content_type == ""
+        return "application/octet-stream"
+    content_type
+
+// The range `list.get` needs as a default, for the one-range case whose
+// caller has already established the length.  Never read and never
+// sent.
+fn first_range() -> staticrange.StaticRange
+    StaticRange { first: 0, last: 0 }
+
+// The boundary of a multipart answer, taken from the entry's own
+// digest: the hex characters are a function of the file's bytes, so a
+// body containing them would contain the hex of its own SHA-256, and a
+// constant boundary is a string a stylesheet could hold by accident.
+fn boundary_for(e: staticmeta.StaticEntry) -> Str
+    let tag = e.etag
+    var body = tag
+    if str.starts_with(body, "W/")
+        body = str.slice(body, 2, str.len(body))
+    let n = str.len(body)
+    if n >= 2 and str.starts_with(body, "\"")
+        body = str.slice(body, 1, n - 1)
+    let out = "nova" + body
+    out
+
+// The 200: the whole file, or — for a HEAD — the headers a GET would
+// answer with and no body.
+fn whole_answer(r: StaticRoot, e: staticmeta.StaticEntry, serving: staticmeta.StaticEntry,
+                coding: staticenc.StaticCoding,
+                is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let relative = serving.relative
+    var body = no_bytes()
+    var length = serving.size
+    if not is_head
+        body = read_all(r, relative)!
+        length = bytes.len(body)
+    let extras = body_extras(e.content_type, coding, length, "")
+    let headers = file_headers(serving, extras)
+    Ok(StaticServed {
+        status: 200,
+        headers: headers,
+        body: body,
+        relative: relative })
+
+// Several ranges as one document: each part's header and bytes in
+// turn, then the closing delimiter, joined once.  Every part is read
+// positionally — one read per range — rather than read whole and
+// sliced, and there is no separator between a part's bytes and the
+// next part's header, which is what `staticrange.multipart_len`
+// counts.
+fn multipart_body(r: StaticRoot, relative: Str, rs: [staticrange.StaticRange], boundary: Str,
+                  media_type: Str, size: Int) -> Result<Bytes, staticerr.StaticFault> [fs]
+    var chunks: [Bytes] = []
+    for one in rs
+        let head = staticrange.part_header(boundary, media_type, one, size)
+        chunks = list.push(chunks, bytes.from_str(head))
+        let part = read_range(r, relative, one)!
+        chunks = list.push(chunks, bytes.clone(part))
+    let closing = staticrange.multipart_end(boundary)
+    chunks = list.push(chunks, bytes.from_str(closing))
+    let joined = bytes.concat(chunks)
+    Ok(joined)
+
+// Several ranges as a multipart document, with the boundary and the
+// part type the arithmetic in `staticrange` assumes.  The length comes
+// from `multipart_len` rather than from the assembled body, so the
+// header is one number whichever way the body was built.
+fn multipart_answer(r: StaticRoot, e: staticmeta.StaticEntry, serving: staticmeta.StaticEntry,
+                    coding: staticenc.StaticCoding, rs: [staticrange.StaticRange],
+                    is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let relative = serving.relative
+    let size = serving.size
+    let boundary = boundary_for(serving)
+    let media = staticrange.multipart_type(boundary)
+    let inner = part_type(e.content_type)
+    let length = staticrange.multipart_len(rs, boundary, inner, size)
+    var body = no_bytes()
+    if not is_head
+        body = multipart_body(r, relative, rs, boundary, inner, size)!
+    let extras = body_extras(media, coding, length, "")
+    let headers = file_headers(serving, extras)
+    Ok(StaticServed {
+        status: 206,
+        headers: headers,
+        body: body,
+        relative: relative })
+
+// One range as the bytes themselves.  A client that asked for one
+// range gets it unframed, which is what every server it has ever
+// talked to sent.
+fn ranged_body(r: StaticRoot, e: staticmeta.StaticEntry, serving: staticmeta.StaticEntry,
+               coding: staticenc.StaticCoding, rs: [staticrange.StaticRange],
+               is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    if list.len(rs) != 1
+        return multipart_answer(r, e, serving, coding, rs, is_head)
+    let span = list.get(rs, 0, first_range())
+    let relative = serving.relative
+    let size = serving.size
+    let length = staticrange.range_len(span)
+    var body = no_bytes()
+    if not is_head
+        body = read_range(r, relative, span)!
+    let detail = staticrange.content_range(span, size)
+    let extras = body_extras(e.content_type, coding, length, detail)
+    let headers = file_headers(serving, extras)
+    Ok(StaticServed {
+        status: 206,
+        headers: headers,
+        body: body,
+        relative: relative })
+
+// The 416: no body, the `Content-Range` that tells a client how big
+// the file actually is, and the validators — a download that resumed
+// from a stale idea of the length needs both to correct itself.
+fn unsatisfied_answer(serving: staticmeta.StaticEntry) -> StaticServed
+    let detail = staticrange.unsatisfiable_header(serving.size)
+    let extras = [("Content-Range", detail), ("Content-Length", "0")]
+    bare(416, file_headers(serving, extras), serving.relative)
+
+// The 206, or one of the two things a `Range` that is not answered
+// with one means.  A range set the limits refuse — too many, malformed,
+// or over the amplification ceiling — is answered with the whole file
+// rather than a 416, which is what `staticerr.status_for` means by a
+// refused range; only "every range missed the file" is a 416.
+fn ranged_answer(r: StaticRoot, e: staticmeta.StaticEntry, serving: staticmeta.StaticEntry,
+                 coding: staticenc.StaticCoding, asked: Str,
+                 is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let parsed = staticrange.parse(asked, serving.size, r.ranges)
+    match parsed
+        Ok(rs)                                  => ranged_body(r, e, serving, coding, rs, is_head)
+        Err(StaticRangeUnsatisfiable(_, known)) => Ok(unsatisfied_answer(serving))
+        Err(_)                                  => whole_answer(r, e, serving, coding, is_head)
+
+// The answer for a file, which both serving paths end in: the
+// conditional requests, the `Range`, the read and the headers.
+//
+// `stored` is the entry for the bytes the coding names, absent where
+// the sibling was not found — and then the file itself goes out as
+// identity rather than plain bytes wearing a coding's label.
+fn answer(r: StaticRoot, e: staticmeta.StaticEntry, stored: ?staticmeta.StaticEntry,
+          coding: staticenc.StaticCoding, header: fn(Str) -> Str [],
+          is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    var serving = e
+    var named = staticenc.StaticIdentity
+    let found = stored
+    if let Some(s) = found
+        serving = s
+        named = coding
+    let conditions = staticmeta.conditions_of(header)
+    let status = staticmeta.evaluate(conditions, serving, true)
+    let relative = serving.relative
+    if status == 304
+        return Ok(bare(304, file_headers(serving, []), relative))
+    if status == 412
+        return Ok(bare(412, file_headers(serving, [("Content-Length", "0")]), relative))
+    let asked = header("Range")
+    if staticrange.is_byte_range(asked) and staticmeta.range_allowed(conditions, serving)
+        return ranged_answer(r, e, serving, named, asked, is_head)
+    whole_answer(r, e, serving, named, is_head)
+
+// Whether a directory target should be redirected to its
+// trailing-slash form.  A path without one makes every relative link
+// in the page resolve one level too high.
+fn wants_slash(r: StaticRoot, target: Str) -> Bool
+    not str.ends_with(target, "/") and r.policy.redirect_directories
+
+// A 301 to the trailing-slash form, with the query preserved: a link
+// inside the page is resolved against the whole URL, so dropping the
+// query breaks a permalink.
+fn redirect_answer(location: Str) -> StaticServed
+    plain(301, [("Location", location), ("Content-Length", "0")], "")
+
+// What a refused path answers: the status a refusal maps to, which is
+// a 404 for every one of them, and no body.  The detail goes to the
+// caller's log rather than to the client, so that `/etc/passwd` and
+// `/nothing` look identical from outside.
+fn refusal_answer(reason: staticerr.StaticRefusal) -> StaticServed
+    let status = staticerr.refusal_status(reason)
+    plain(status, [("Content-Length", "0")], "")
+
+// What a listing adds to the three every answer carries: the media
+// type, and the stamp the scan or the directory itself answered.
+fn listing_extras(stamp: ?civil.CivilDateTime, length: Int) -> [(Str, Str)]
+    var out: [(Str, Str)] = []
+    out = list.push(out, ("Content-Type", "text/html; charset=utf-8"))
+    let at = stamp
+    if let Some(when) = at
+        let line = staticmeta.format_http_date(when)
+        out = list.push(out, ("Last-Modified", line))
+    out = list.push(out, ("Content-Length", str.from_int(length)))
+    out
+
+// A name escaped for HTML: the five characters that can close an
+// attribute or open a tag.  A file name is data the deployment did not
+// write — an upload directory holds a stranger's string — so a listing
+// that pastes one into markup is a stored cross-site script in every
+// browser that reads it.
+fn html_safe(name: Str) -> Str
+    let sb = str.builder_new()
+    var i = 0
+    while i < str.len(name)
+        let b = str.byte_at_or(name, i, 0)
+        if b == '&'
+            str.builder_append(sb, "&amp;")
+        else if b == '<'
+            str.builder_append(sb, "&lt;")
+        else if b == '>'
+            str.builder_append(sb, "&gt;")
+        else if b == '"'
+            str.builder_append(sb, "&quot;")
+        else if b == '\''
+            str.builder_append(sb, "&#39;")
+        else
+            str.builder_append_char(sb, b)
+        i = i + 1
+    let out = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    out
+
+// A name as the path half of an href.  Three bytes are spelled as
+// percent escapes because a browser does not repair them: a raw `?`
+// begins the query, a raw `#` begins the fragment, and a raw `%` is
+// passed through — so a file called `pct%20.txt` would be asked for as
+// `pct b.txt` and answer 404.  Every other byte the URL parser encodes
+// on its own, and the five markup characters are escaped when the
+// attribute is written.
+fn href_safe(name: Str) -> Str
+    let sb = str.builder_new()
+    var i = 0
+    while i < str.len(name)
+        let b = str.byte_at_or(name, i, 0)
+        if b == '%'
+            str.builder_append(sb, "%25")
+        else if b == '?'
+            str.builder_append(sb, "%3F")
+        else if b == '#'
+            str.builder_append(sb, "%23")
+        else
+            str.builder_append_char(sb, b)
+        i = i + 1
+    let out = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    out
+
+// The HTML of a listing: a title, a heading, and one link per name.
+// Every href is prefixed with `./`, so a file whose name begins with a
+// scheme is a relative path and not a link that runs it.
+fn listing_page(target: Str, names: [Str]) -> Str
+    let sb = str.builder_new()
+    str.builder_append(sb, "<!doctype html>\n<title>Index of ")
+    let shown = html_safe(target)
+    str.builder_append(sb, shown)
+    str.builder_append(sb, "</title>\n<h1>Index of ")
+    str.builder_append(sb, shown)
+    str.builder_append(sb, "</h1>\n<ul>\n")
+    for name in names
+        let href = html_safe(href_safe(name))
+        let label = html_safe(name)
+        str.builder_append(sb, "<li><a href=\"./")
+        str.builder_append(sb, href)
+        str.builder_append(sb, "\">")
+        str.builder_append(sb, label)
+        str.builder_append(sb, "</a></li>\n")
+    str.builder_append(sb, "</ul>\n")
+    let out = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    out
+
+// A listing, as a page of the names the policy will serve.  A reader
+// gets a page rather than a directory: `list_directories` is off by
+// default, and a deployment that turned it on wants the listing.
+fn listing_answer(r: StaticRoot, relative: Str, target: Str, stamp: ?civil.CivilDateTime,
+                  is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let names = list_dir(r, relative)!
+    let page = listing_page(target, names)
+    let body = bytes.from_str(page)
+    let length = bytes.len(body)
+    let headers = base_headers(listing_extras(stamp, length))
+    if is_head
+        return Ok(bare(200, headers, relative))
+    Ok(StaticServed {
+        status: 200,
+        headers: headers,
+        body: body,
+        relative: relative })
+
+// When a directory was last changed, from its own modification time.
+// Absent where the filesystem answers none, and the listing then goes
+// out without a `Last-Modified` rather than with an invented one.
+fn directory_stamp(path: Str) -> ?civil.CivilDateTime [fs]
+    let seconds = fs.file_mtime(path)
+    match seconds
+        // cov: skip — a directory that was just walked answers a time
+        None    => None
+        Some(s) => Some(from_epoch_seconds(s))
+
+// The entry for a directory's index file: the first name in the policy
+// that the index holds.  A directory holding two of them serves the
+// earlier name, which is the order `staticpath` would have used.
+fn index_file(ix: StaticIndex, relative: Str) -> ?staticmeta.StaticEntry
+    let r = ix.root
+    for name in r.policy.index_names
+        let candidate = below(relative, name)
+        let found = lookup(ix, candidate)
+        if let Some(e) = found
+            return Some(e)
+    None
+
+// The entry for the bytes a coding names, from the index: the file
+// itself for identity, and a lookup of the sibling's path otherwise.
+//
+// The lookup is the index's answer, and the index outlives the disk it
+// was built from: the `kind_of` is one `stat` that separates a sibling
+// that is still there from one that a deploy removed.  Without it the
+// bytes behind the entry could not be read and the request would be
+// refused rather than answered with the file itself.
+fn stored_in_index(ix: StaticIndex, e: staticmeta.StaticEntry,
+                   coding: staticenc.StaticCoding) -> ?staticmeta.StaticEntry [fs]
+    if coding == staticenc.StaticIdentity
+        return Some(e)
+    let relative = e.relative
+    let sibling = staticenc.sibling_path(relative, coding)
+    if not sibling_is_file(ix.root, relative, coding)
+        return None
+    lookup(ix, sibling)
+
+// The answer for a file the index holds: the sibling comes from the
+// index too, so nothing here reads the disk but the bytes themselves.
+fn indexed_answer(ix: StaticIndex, e: staticmeta.StaticEntry, header: fn(Str) -> Str [],
+                  is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let enc = encodings_of(ix, e.relative)
+    let chosen = staticenc.choose(header("Accept-Encoding"), enc)
+    let Some(wanted) = chosen else
+        return Ok(plain(406, [("Content-Length", "0")], ""))
+    let sibling = stored_in_index(ix, e, wanted)
+    answer(ix.root, e, sibling, wanted, header, is_head)
+
+// The entry for the bytes a coding names, read now: the file itself
+// for identity, and a full entry for the sibling otherwise, which is
+// the read an index saves.
+fn stored_live(r: StaticRoot, e: staticmeta.StaticEntry,
+               coding: staticenc.StaticCoding) -> ?staticmeta.StaticEntry [fs]
+    if coding == staticenc.StaticIdentity
+        return Some(e)
+    let relative = e.relative
+    let sibling = staticenc.sibling_path(relative, coding)
+    let got = stat_one(r, sibling)
+    match got
+        Ok(s)  => Some(s)
+        Err(_) => None
+
+// The answer for a file on the live path: a sibling costs a `stat` and
+// a read of its own, which is what an index saves.
+fn live_answer(r: StaticRoot, relative: Str, header: fn(Str) -> Str [],
+               is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let e = stat_one(r, relative)!
+    let enc = siblings_of(r, relative)
+    let chosen = staticenc.choose(header("Accept-Encoding"), enc)
+    let Some(wanted) = chosen else
+        return Ok(plain(406, [("Content-Length", "0")], ""))
+    let sibling = stored_live(r, e, wanted)
+    answer(r, e, sibling, wanted, header, is_head)
+
+// The first index name that is a file inside a directory, asked of the
+// disk rather than of an index.
+fn live_index_file(r: StaticRoot, relative: Str) -> ?Str [fs]
+    for name in r.policy.index_names
+        let candidate = below(relative, name)
+        if kind_of(r, candidate) == staticpath.kind_file()
+            return Some(candidate)
+    None
+
+// The path the index holds neither a file nor an index file for: a
+// directory with a listing, a directory to redirect, or nothing at
+// all.  The `stat` is what separates them, because an index holds
+// files and not directories.
+fn not_a_file(ix: StaticIndex, relative: Str, target: Str, query: Str, header: fn(Str) -> Str [],
+              is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let r = ix.root
+    let on_disk = staticpath.join_root(r.path, relative)
+    if not fs.is_dir(on_disk)
+        return Ok(plain(404, [("Content-Length", "0")], ""))
+    if wants_slash(r, target)
+        return Ok(redirect_answer(staticpath.directory_redirect(target, query)))
+    if not r.policy.list_directories
+        return Err(staticerr.StaticNoIndex(on_disk))
+    listing_answer(r, relative, target, ix.scanned_at, is_head)
+
+// A path the index holds no file for: an index file inside it, a
+// redirect to its trailing-slash form, a listing, or a 404.  The order
+// is `staticpath`'s, so an indexed answer and a resolved one agree.
+fn serve_directory(ix: StaticIndex, relative: Str, target: Str, query: Str,
+                   header: fn(Str) -> Str [],
+                   is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let named = index_file(ix, relative)
+    let Some(found) = named else
+        return not_a_file(ix, relative, target, query, header, is_head)
+    if wants_slash(ix.root, target)
+        return Ok(redirect_answer(staticpath.directory_redirect(target, query)))
+    indexed_answer(ix, found, header, is_head)
+
+// The indexed path's decisions, in the order a request pays for them:
+// the file, a directory's index file, the redirect, the listing, and
+// then nothing.
+fn serve_indexed(ix: StaticIndex, relative: Str, target: Str, query: Str, header: fn(Str) -> Str [],
+                 is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let found = lookup(ix, relative)
+    if let Some(e) = found
+        return indexed_answer(ix, e, header, is_head)
+    serve_directory(ix, relative, target, query, header, is_head)
+
+// A directory with no index file on the live path: the redirect, the
+// listing, or the fault that says this root has nothing to serve here.
+fn live_listing(r: StaticRoot, relative: Str, target: Str, query: Str, header: fn(Str) -> Str [],
+                is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    if wants_slash(r, target)
+        return Ok(redirect_answer(staticpath.directory_redirect(target, query)))
+    let on_disk = staticpath.join_root(r.path, relative)
+    if not r.policy.list_directories
+        return Err(staticerr.StaticNoIndex(on_disk))
+    let stamp = directory_stamp(on_disk)
+    listing_answer(r, relative, target, stamp, is_head)
+
+// A directory on the live path: its index file, the redirect, the
+// listing, or the fault.
+fn live_directory(r: StaticRoot, relative: Str, target: Str, query: Str, header: fn(Str) -> Str [],
+                  is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let named = live_index_file(r, relative)
+    let Some(found) = named else
+        return live_listing(r, relative, target, query, header, is_head)
+    if wants_slash(r, target)
+        return Ok(redirect_answer(staticpath.directory_redirect(target, query)))
+    live_answer(r, found, header, is_head)
+
+// The live path's decisions, in the same order as the indexed one.
+// The three answers `staticpath.resolve` reaches with a predicate are
+// reached here by asking the disk, because that predicate slot's row
+// is `[]` and nothing that reads a file can fill it.
+fn live_path(r: StaticRoot, relative: Str, target: Str, query: Str, header: fn(Str) -> Str [],
+             is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
+    let kind = kind_of(r, relative)
+    if kind == staticpath.kind_file()
+        return live_answer(r, relative, header, is_head)
+    if kind == staticpath.kind_missing()
+        return Ok(plain(404, [("Content-Length", "0")], ""))
+    live_directory(r, relative, target, query, header, is_head)
 
 // A whole request answered from an index: the status, the headers and
 // the bytes.
@@ -397,7 +1171,11 @@ pub fn list_dir(r: StaticRoot, relative: Str) -> Result<[Str], staticerr.StaticF
 // ```
 pub fn serve(ix: StaticIndex, target: Str, query: Str, header: fn(Str) -> Str [],
              is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
-    todo("static-nv.staticfs.serve")
+    let r = ix.root
+    let checked = staticpath.check(target, r.policy)
+    match checked
+        Err(refusal) => Ok(refusal_answer(refusal))
+        Ok(relative) => serve_indexed(ix, relative, target, query, header, is_head)
 
 // The same, without an index: every metadata question asked now.
 //
@@ -417,7 +1195,12 @@ pub fn serve(ix: StaticIndex, target: Str, query: Str, header: fn(Str) -> Str []
 // ```
 pub fn serve_live(r: StaticRoot, target: Str, query: Str, header: fn(Str) -> Str [],
                   is_head: Bool) -> Result<StaticServed, staticerr.StaticFault> [fs]
-    todo("static-nv.staticfs.serve_live")
+    if not root_is_there(r)
+        return Err(staticerr.StaticRootUnreadable(r.path, "not a directory"))
+    let checked = staticpath.check(target, r.policy)
+    match checked
+        Err(refusal) => Ok(refusal_answer(refusal))
+        Ok(relative) => live_path(r, relative, target, query, header, is_head)
 
 // A header from a served response, or empty.
 //
@@ -430,26 +1213,31 @@ pub fn serve_live(r: StaticRoot, target: Str, query: Str, header: fn(Str) -> Str
 //     println(staticfs.served_header(s, "ETag"))
 // ```
 pub fn served_header(s: StaticServed, name: Str) -> Str []
-    todo("static-nv.staticfs.served_header")
+    for pair in s.headers
+        let (key, value) = pair
+        if key == name
+            return value
+    ""
 
 // Whether containment against this root is only lexical.
 //
-// **`true` today**, and the reason is named rather than hidden: the
-// standard library answers no symbolic-link question — no `realpath`,
-// no `readlink`, no link flag on any metadata call — so neither
-// `staticpath` nor this module can prove that a resolved path stays
-// inside the root once a symbolic link is in the way.  What IS proved
-// is that the path is inside the root as a string: every segment
-// checked, no traversal, no encoded separator, no NUL.
+// `true`, and the reason is named rather than hidden: what is proved is
+// that a path is inside the root AS A STRING — every segment checked,
+// no traversal, no encoded separator, no NUL.  What is not proved is
+// that no symbolic link stands between the root and the file, and this
+// package asks that question nowhere: the standard library answers it
+// — `realpath`, `is_symlink`, `read_link` — and it is the deployment
+// that decides whether it needs the answer.
 //
 // A root a deployment wrote itself is safe.  A root that accepts
 // uploads, or that a person can put links in, is not — and a
-// deployment in that position should hold its files somewhere a
-// symbolic link cannot be created.
+// deployment in that position should call `fs.is_symlink` on the path
+// before serving it, or hold its files somewhere a symbolic link
+// cannot be created.
 //
 // Published as a function so a deployment's own audit asserts it, and
-// so the day a `realpath` lands the answer changes here and nowhere
-// else.
+// so that a caller who adds a link check of its own can see exactly
+// what this package was and was not claiming.
 //
 // ```novo
 // use staticfs
@@ -458,4 +1246,4 @@ pub fn served_header(s: StaticServed, name: Str) -> Str []
 //     println("${staticfs.containment_is_lexical_only()}")
 // ```
 pub fn containment_is_lexical_only() -> Bool []
-    todo("static-nv.staticfs.containment_is_lexical_only")
+    true

@@ -5,6 +5,77 @@ All notable changes to static-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-10-11
+
+The implementation.  Every `todo()` body in the six modules is
+replaced, `stability` is `"experimental"`, and the manifest floor is
+`novo = ">= 0.20.2"`, the toolchain every measurement below was taken
+on.  `novo test --isolate tests` is green — 105 tests in six modules,
+and no leak line — and merged line coverage of `src/` is 999 of 1002
+lines, the three left excused in the source.
+
+### Added
+
+- `tests/static_edge_tests.nv`, 26 tests — the sixth suite, and the only
+  one that writes anything.  Its first half builds a root under
+  `fs.temp_dir()` holding a file, a precompressed sibling, a dotfile, a
+  symbolic link and a subdirectory, and drives a scan, a lookup, a range
+  read, a listing and the two serve calls through it.  Its second half
+  reaches the arms a table-driven suite leaves: the detail, the status
+  and the probing verdict of all nine refusals, the codings and suffixed
+  paths `staticenc` answers, the conditional forms the precedence table
+  does not name, the range grammar the parser refuses, and an index
+  built by hand so a weak validator reaches the multipart path without a
+  file to compute one from.
+
+### Changed
+
+- **The 0.0.x statements about what the standard library cannot answer
+  are corrected here rather than rewritten.**  `std.fs` answers a file's
+  modification time and it answers symbolic-link questions — `realpath`,
+  `is_symlink` and `read_link` — as of novo 0.10.0, so `staticfs` dates
+  every scanned entry from `fs.file_mtime` and a listing carries a real
+  `Last-Modified`, and the missing containment check is now a decision
+  this package makes rather than one the platform forced.  The 0.0.1
+  design note about replacing "the standard library's thirteen-line
+  handler" named a thing the standard library does not have:
+  `std.http_server` routes and writes a response, and serves no file.
+
+### Known
+
+- **Containment is lexical only, and it is measured.**
+  `staticfs.containment_is_lexical_only()` answers `true`, and
+  `tests/static_edge_tests.nv` puts a symbolic link inside the root
+  pointing at a file outside it: every segment is one the resolver
+  allows, the path is inside the root as a string, and the bytes that
+  come back are not.  A root a deployment controls end to end is safe;
+  a root a stranger can write into is the one where this costs
+  something, and a deployment in that position asks `fs.is_symlink` on
+  each path or holds its files where a link cannot be made.
+- **Three arms are excused where they stand.**  No filesystem this
+  package can reach produces them: `staticfs.clock_time`'s refusal of
+  three integers that are in range by construction, and the absent
+  modification time in `dated` and `directory_stamp`, for a file and a
+  directory a walk has just read.  Each carries a `cov: skip` marker
+  naming the reason, and the three are named in
+  `tests/static_edge_tests.nv`; `novo pkg publish --dry-run` reports
+  the excused regions itself.
+- **`fs.read_bytes` on a directory aborts the process** with a huge
+  allocation instead of answering `None`, and a directory named after a
+  file is something a stranger who can write into a root can create;
+  filed against the `novo` package as
+  `stdlib/fs-read-bytes-on-a-directory-ooms-the-process` (open,
+  0.20.2).  `staticfs.read_file_bytes` asks `fs.is_file` first, which is
+  the check a caller reading a path it did not create should make
+  regardless.  The guard stays when that is fixed.
+- **No local is named after a stdlib module.**  A binding named `path`
+  or `time` shadows the module — W0002 — and a `match` over it with a
+  call through the module's name in an arm is an internal compiler
+  error the per-module check passes; filed as
+  `typecheck/a-local-that-shadows-a-stdlib-module-ices-a-match-over-it`
+  (open, 0.20.2).  `on_disk` and `clock_value` are the longer names
+  that avoid it, and they are the clearer names either way.
+
 ## 0.0.2 — 2026-09-18
 
 `StaticRefusal` implements `Error`; no signature changed.  README rewritten to the package README style guide (docs/writing-a-readme.md).

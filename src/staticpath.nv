@@ -2,8 +2,6 @@
 // refused.  The load-bearing module of this package, and it performs
 // nothing.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE ORDER OF THE TWO STEPS IS THE WHOLE SECURITY ARGUMENT, and it is
 // the opposite of what a reader expects.
 //
@@ -41,15 +39,18 @@
 // WHAT `[]` CANNOT BUY: SYMLINKS.  A lexical resolver proves that the
 // path it built is inside the root as a STRING.  It cannot know that
 // `root/uploads/x` is a symbolic link to `/etc/shadow`, because
-// finding that out means asking the filesystem.  The standard library
-// answers no symbolic-link question at all — there is no `realpath`,
-// no `readlink`, no link flag on a stat — so `staticfs` cannot perform
-// the second check either, and `staticfs.containment_is_lexical_only`
-// says so out loud rather than letting a deployment assume otherwise.
-// A root that contains no symbolic links is safe; a root that accepts
-// uploads and follows them is not, and the honest interface is the one
-// that says which.
+// finding that out means asking the filesystem and this module asks it
+// nothing.  `staticfs` does not ask either: its one containment
+// answer, `staticfs.containment_is_lexical_only`, says so out loud
+// rather than letting a deployment assume otherwise.  A caller that
+// wants the second check has `fs.realpath` — resolve the root and the
+// file and compare the two — and a root that contains no symbolic link
+// is safe without it.  The honest interface is the one that says
+// which, and a root that accepts uploads and follows them needs the
+// check.
 
+use std.list
+use std.str
 use staticerr
 
 // What a request target resolved to.
@@ -114,7 +115,13 @@ pub struct StaticPolicy
 //     println("${staticpath.defaults().list_directories}")
 // ```
 pub fn defaults() -> StaticPolicy []
-    todo("static-nv.staticpath.defaults")
+    StaticPolicy {
+        index_names: ["index.html"],
+        list_directories: false,
+        serve_hidden: false,
+        redirect_directories: true,
+        max_segments: 32,
+        max_bytes: 1024 }
 
 // The same policy with directory listings on.
 //
@@ -130,7 +137,13 @@ pub fn defaults() -> StaticPolicy []
 //     println("${staticpath.with_listings(staticpath.defaults()).list_directories}")
 // ```
 pub fn with_listings(p: StaticPolicy) -> StaticPolicy []
-    todo("static-nv.staticpath.with_listings")
+    StaticPolicy {
+        index_names: p.index_names,
+        list_directories: true,
+        serve_hidden: p.serve_hidden,
+        redirect_directories: p.redirect_directories,
+        max_segments: p.max_segments,
+        max_bytes: p.max_bytes }
 
 // The same policy with a different set of index file names.
 //
@@ -143,7 +156,13 @@ pub fn with_listings(p: StaticPolicy) -> StaticPolicy []
 //     println("${list.len(p.index_names)}")
 // ```
 pub fn with_index_names(p: StaticPolicy, names: [Str]) -> StaticPolicy []
-    todo("static-nv.staticpath.with_index_names")
+    StaticPolicy {
+        index_names: names,
+        list_directories: p.list_directories,
+        serve_hidden: p.serve_hidden,
+        redirect_directories: p.redirect_directories,
+        max_segments: p.max_segments,
+        max_bytes: p.max_bytes }
 
 // The same policy serving dotfiles.
 //
@@ -161,7 +180,13 @@ pub fn with_index_names(p: StaticPolicy, names: [Str]) -> StaticPolicy []
 //     println("${staticpath.with_hidden(staticpath.defaults()).serve_hidden}")
 // ```
 pub fn with_hidden(p: StaticPolicy) -> StaticPolicy []
-    todo("static-nv.staticpath.with_hidden")
+    StaticPolicy {
+        index_names: p.index_names,
+        list_directories: p.list_directories,
+        serve_hidden: true,
+        redirect_directories: p.redirect_directories,
+        max_segments: p.max_segments,
+        max_bytes: p.max_bytes }
 
 // Whether a first segment is the one dotted path that has to work.
 //
@@ -179,18 +204,49 @@ pub fn with_hidden(p: StaticPolicy) -> StaticPolicy []
 //     println("${staticpath.is_well_known(".well-known")}")
 // ```
 pub fn is_well_known(segment: Str) -> Bool []
-    todo("static-nv.staticpath.is_well_known")
+    segment == ".well-known"
 
 // ── The resolver ─────────────────────────────────────────────────────
+
+// A directory and one name inside it: the slash belongs between them
+// only where the directory is not the root itself, which is empty.
+fn child(dir: Str, name: Str) -> Str
+    if dir == ""
+        return name
+    let prefix = dir + "/"
+    let joined = prefix + name
+    joined
+
+// The first index name that is a file inside a directory, or the
+// directory itself where none of them is.
+fn index_of(relative: Str, p: StaticPolicy, exists: fn(Str) -> Int []) -> StaticResolved
+    for name in p.index_names
+        let candidate = child(relative, name)
+        if exists(candidate) == kind_file()
+            return StaticIndex(candidate)
+    StaticDirectory(relative)
+
+// The filesystem half of `resolve`: one `exists` question about the
+// checked path, and the redirect where the target named a directory
+// without a trailing slash.
+fn checked_kind(relative: Str, target: Str, p: StaticPolicy,
+                exists: fn(Str) -> Int []) -> StaticResolved
+    if exists(relative) == kind_file()
+        return StaticFile(relative)
+    if not str.ends_with(target, "/") and p.redirect_directories
+        return StaticRedirect(directory_redirect(target, ""))
+    index_of(relative, p, exists)
 
 // A request target resolved against a root, WITHOUT touching a disk.
 //
 // The `exists` argument is what makes that possible: it is a predicate
 // the caller supplies, answering whether a relative path is a file, a
-// directory, or neither.  `staticfs.resolve` passes one backed by the
-// filesystem; a test passes one backed by a list of strings, which is
-// what lets the entire rule set be asserted with no directory in the
-// room.
+// directory, or neither.  A deployment backs one with the index it
+// scanned at start-up, which `staticfs.lookup` answers from a value; a
+// test passes one backed by a list of strings, which is what lets the
+// entire rule set be asserted with no directory in the room.  A
+// predicate that reads a disk cannot go here — this module is `[]`, and
+// the checker refuses the wider row.
 //
 // The steps, in this order:
 //
@@ -225,14 +281,16 @@ pub fn is_well_known(segment: Str) -> Bool []
 //         StaticRefused(_)  => println("refused")
 // ```
 pub fn resolve(target: Str, p: StaticPolicy, exists: fn(Str) -> Int []) -> StaticResolved []
-    todo("static-nv.staticpath.resolve")
+    match check(target, p)
+        Err(r)       => StaticRefused(r)
+        Ok(relative) => checked_kind(relative, target, p, exists)
 
 // The integer `exists` answers for "not there".
 //
 // The three codes are functions rather than an enum so that the
 // predicate a caller writes is a plain `fn(Str) -> Int` — which is
-// what lets it be a closure over a list in a test and a filesystem
-// call in `staticfs` with no trait in between.
+// what lets it be a closure over a list in a test and a lookup in an
+// index with no trait in between.
 //
 // ```novo
 // use staticpath
@@ -241,7 +299,7 @@ pub fn resolve(target: Str, p: StaticPolicy, exists: fn(Str) -> Int []) -> Stati
 //     println("${staticpath.kind_missing()}")
 // ```
 pub fn kind_missing() -> Int []
-    todo("static-nv.staticpath.kind_missing")
+    0
 
 // The integer `exists` answers for a regular file.
 //
@@ -252,7 +310,7 @@ pub fn kind_missing() -> Int []
 //     println("${staticpath.kind_file()}")
 // ```
 pub fn kind_file() -> Int []
-    todo("static-nv.staticpath.kind_file")
+    1
 
 // The integer `exists` answers for a directory.
 //
@@ -263,7 +321,7 @@ pub fn kind_file() -> Int []
 //     println("${staticpath.kind_directory()}")
 // ```
 pub fn kind_directory() -> Int []
-    todo("static-nv.staticpath.kind_directory")
+    2
 
 // The resolution alone, with no `exists` question: the checked
 // relative path, or a refusal.
@@ -282,7 +340,24 @@ pub fn kind_directory() -> Int []
 //         Err(_) => println("refused")
 // ```
 pub fn check(target: Str, p: StaticPolicy) -> Result<Str, staticerr.StaticRefusal> []
-    todo("static-nv.staticpath.check")
+    if not str.starts_with(target, "/")
+        return Err(staticerr.StaticNotRooted)
+    let segs = segments(target)
+    let count = list.len(segs)
+    if count > p.max_segments
+        return Err(staticerr.StaticTooDeep(count, p.max_segments))
+    var index = 0
+    for s in segs
+        match check_segment(s, index, p)
+            None    =>
+                index = index + 1
+            Some(r) =>
+                return Err(r)
+    let relative = str.join(segs, "/")
+    let n = str.len(relative)
+    if n > p.max_bytes
+        return Err(staticerr.StaticTooLong(n, p.max_bytes))
+    Ok(relative)
 
 // A checked relative path joined to a root.
 //
@@ -298,7 +373,14 @@ pub fn check(target: Str, p: StaticPolicy) -> Result<Str, staticerr.StaticRefusa
 //     println(staticpath.join_root("/srv/site", "css/site.css"))
 // ```
 pub fn join_root(root: Str, relative: Str) -> Str []
-    todo("static-nv.staticpath.join_root")
+    if relative == ""
+        return root
+    if str.ends_with(root, "/")
+        let joined = root + relative
+        return joined
+    let prefix = root + "/"
+    let joined = prefix + relative
+    joined
 
 // The relative path a resolution names, or empty for a refusal.
 //
@@ -313,7 +395,12 @@ pub fn join_root(root: Str, relative: Str) -> Str []
 //     println(staticpath.relative_of(r))
 // ```
 pub fn relative_of(r: StaticResolved) -> Str []
-    todo("static-nv.staticpath.relative_of")
+    match r
+        StaticFile(relative)      => relative
+        StaticIndex(relative)     => relative
+        StaticDirectory(relative) => relative
+        StaticRedirect(_)         => ""
+        StaticRefused(_)          => ""
 
 // Whether a resolution names something to serve.
 //
@@ -331,12 +418,55 @@ pub fn relative_of(r: StaticResolved) -> Str []
 //     println("${staticpath.is_servable(r)}")
 // ```
 pub fn is_servable(r: StaticResolved) -> Bool []
-    todo("static-nv.staticpath.is_servable")
+    match r
+        StaticFile(_)      => true
+        StaticIndex(_)     => true
+        StaticDirectory(_) => false
+        StaticRedirect(_)  => false
+        StaticRefused(_)   => false
 
 // ── The rules, individually ──────────────────────────────────────────
 //
 // Published one by one, because "the resolver is safe" is not a claim
 // a reader can check and "this is what `..` does after decoding" is.
+
+// One byte of a percent triple as a number, or -1 where it is not a
+// hex digit.  Every dot, slash and NUL this module refuses arrived as
+// a pair of these.
+fn hex_value(b: Int) -> Int
+    if b >= '0' and b <= '9'
+        return b - '0'
+    if b >= 'A' and b <= 'F'
+        return b - 'A' + 10
+    if b >= 'a' and b <= 'f'
+        return b - 'a' + 10
+    -1
+
+// The decode half of the order this module argues for: one raw segment
+// becomes the bytes it names.  A `%` that does not begin a well-formed
+// triple is left as the literal byte it is, because a percent sign is
+// a legal character in a file name.
+fn decode_segment(raw: Str) -> Str
+    let n = str.len(raw)
+    let sb = str.builder_new()
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(raw, i, 0)
+        if b == '%' and i + 2 < n
+            let hi = hex_value(str.byte_at_or(raw, i + 1, 0))
+            let lo = hex_value(str.byte_at_or(raw, i + 2, 0))
+            if hi >= 0 and lo >= 0
+                str.builder_append_char(sb, hi * 16 + lo)
+                i = i + 3
+            else
+                str.builder_append_char(sb, b)
+                i = i + 1
+        else
+            str.builder_append_char(sb, b)
+            i = i + 1
+    let decoded = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    decoded
 
 // Every segment of a target, split on literal `/` and percent-decoded,
 // in order.
@@ -353,7 +483,24 @@ pub fn is_servable(r: StaticResolved) -> Bool []
 //     println("${list.len(staticpath.segments("/a/b/c.txt"))}")
 // ```
 pub fn segments(target: Str) -> [Str] []
-    todo("static-nv.staticpath.segments")
+    let parts = str.split(target, "/")
+    var out: [Str] = []
+    for part in parts
+        if part != ""
+            out = list.push(out, decode_segment(part))
+    out
+
+// The first byte below 0x20 in a decoded segment, or -1 where it has
+// none.  NUL and a control byte are one search and two refusals.
+fn forbidden_byte(decoded: Str) -> Int
+    let n = str.len(decoded)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(decoded, i, 0)
+        if b < ' '
+            return b
+        i = i + 1
+    -1
 
 // Whether a DECODED segment is one this package will build a path
 // from.
@@ -371,7 +518,20 @@ pub fn segments(target: Str) -> [Str] []
 //         None    => println("fine")
 // ```
 pub fn check_segment(decoded: Str, index: Int, p: StaticPolicy) -> ?staticerr.StaticRefusal []
-    todo("static-nv.staticpath.check_segment")
+    if is_dot_segment(decoded)
+        return Some(staticerr.StaticTraversal(index))
+    let bad = forbidden_byte(decoded)
+    if bad == 0
+        return Some(staticerr.StaticNulByte(index))
+    if bad > 0
+        return Some(staticerr.StaticControlByte(index, bad))
+    if str.contains(decoded, "/")
+        return Some(staticerr.StaticEncodedSeparator(index))
+    if str.contains(decoded, "\\")
+        return Some(staticerr.StaticBackslash(index))
+    if is_hidden(decoded) and not p.serve_hidden and not (index == 0 and is_well_known(decoded))
+        return Some(staticerr.StaticHiddenSegment(index))
+    None
 
 // Whether a decoded segment contains a byte that would act as a path
 // separator on any platform this package runs on: `/` or `\`.
@@ -388,7 +548,9 @@ pub fn check_segment(decoded: Str, index: Int, p: StaticPolicy) -> ?staticerr.St
 //     println("${staticpath.has_separator("a/b")}")
 // ```
 pub fn has_separator(decoded: Str) -> Bool []
-    todo("static-nv.staticpath.has_separator")
+    if str.contains(decoded, "/")
+        return true
+    str.contains(decoded, "\\")
 
 // Whether a decoded segment holds a byte no file name legitimately
 // has: NUL, or anything below 0x20.
@@ -406,7 +568,7 @@ pub fn has_separator(decoded: Str) -> Bool []
 //     println("${staticpath.has_forbidden_byte("ok.txt")}")
 // ```
 pub fn has_forbidden_byte(decoded: Str) -> Bool []
-    todo("static-nv.staticpath.has_forbidden_byte")
+    forbidden_byte(decoded) >= 0
 
 // Whether a decoded segment is `.` or `..`.
 //
@@ -419,7 +581,7 @@ pub fn has_forbidden_byte(decoded: Str) -> Bool []
 //     println("${staticpath.is_dot_segment("..")}")
 // ```
 pub fn is_dot_segment(decoded: Str) -> Bool []
-    todo("static-nv.staticpath.is_dot_segment")
+    decoded == "." or decoded == ".."
 
 // Whether a decoded segment begins with a dot.
 //
@@ -435,7 +597,7 @@ pub fn is_dot_segment(decoded: Str) -> Bool []
 //     println("${staticpath.is_hidden(".env")}")
 // ```
 pub fn is_hidden(decoded: Str) -> Bool []
-    todo("static-nv.staticpath.is_hidden")
+    str.starts_with(decoded, ".")
 
 // The redirect location for a directory requested without a trailing
 // slash: the same target with one appended, query string preserved.
@@ -451,4 +613,9 @@ pub fn is_hidden(decoded: Str) -> Bool []
 //     println(staticpath.directory_redirect("/docs", "lang=en"))
 // ```
 pub fn directory_redirect(target: Str, query: Str) -> Str []
-    todo("static-nv.staticpath.directory_redirect")
+    let with_slash = target + "/"
+    if query == ""
+        return with_slash
+    let prefix = with_slash + "?"
+    let full = prefix + query
+    full

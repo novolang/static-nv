@@ -2,17 +2,17 @@
 // answer, and the cache headers that decide whether a request happens
 // at all.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE ETAG IS A CONTENT HASH, AND THAT IS NOT THE DEFAULT ANYBODY
 // WOULD CHOOSE.  Every other static file server computes a WEAK
 // validator from the file's size and its modification time: it is one
 // stat call, it is right almost always, and it costs nothing.
 //
-// This package cannot.  **The standard library answers no modification
-// time at all** — `std.fs` has `size`, `exists`, `is_file`, `read_at`
-// and no stat, and `std.path` has no metadata either.  A size-and-mtime
-// validator is not a thing that can be computed here.
+// This module cannot, and the reason is its effect row.  A
+// modification time is a read of the filesystem — `fs.file_mtime` is an
+// `[fs]` call — and every function here is `[]`, so an entry is built
+// from the bytes a caller hands it and from nothing else.  A
+// size-and-mtime validator is not a thing this module can compute with
+// a disk in the room.
 //
 // So the validator is `sha256` of the content, which is a STRONG one:
 // correct by construction, usable for a range request's `If-Range`
@@ -27,14 +27,15 @@
 // static site generator already has.
 //
 // `Last-Modified` has the same root and a different consequence.  With
-// no modification time there is nothing truthful to put in it, so this
-// package emits it only from a time the caller supplied through
-// `with_modified`, and `entry` leaves it absent rather than inventing
-// one.  An absent
+// no clock and no disk in its row this module has no modification time
+// to put in the header unless the caller supplies one, and `entry`
+// leaves it absent rather than inventing it.  `with_modified` is where
+// a caller who knows — a build stamp, a deploy time, a manifest — says
+// so, and `staticfs.scan` dates an entry from `fs.file_mtime` where the
+// filesystem answers one.  An absent
 // `Last-Modified` costs nothing: `ETag` and `If-None-Match` do the
 // whole job, and RFC 9110 § 13.1.3 makes `If-Modified-Since` the
-// weaker of the two anyway.  Both gaps are filed against the standard
-// library rather than worked around.
+// weaker of the two anyway.
 //
 // THE PRECEDENCE OF CONDITIONAL HEADERS IS RFC 9110 § 13.2.2, AND IT
 // IS NOT THE ORDER THEY ARRIVE IN.  `If-Match` before
@@ -45,7 +46,13 @@
 // gets a 200 from servers that should have sent it a 304.
 // `evaluate` is that whole table in one function.
 
+use std.bytes
+use std.list
+use std.str
 use civil
+use hashing
+use mimeext
+use strfmt
 
 // What a caller knows about one file.
 //
@@ -105,7 +112,18 @@ pub struct StaticCache
 //     println(e.etag)
 // ```
 pub fn entry(relative: Str, content: Bytes) -> StaticEntry []
-    todo("static-nv.staticmeta.entry")
+    let digest = hashing.sha256(content)
+    let head = bytes.slice(digest, 0, 16)
+    let tag = quote_etag(bytes.to_hex(head))
+    let size = bytes.len(content)
+    let kind = mimeext.type_for_name(relative)
+    StaticEntry {
+        relative: relative,
+        size: size,
+        etag: tag,
+        etag_weak: false,
+        content_type: kind,
+        modified_at: None }
 
 // An entry with a validator the caller already has.
 //
@@ -123,7 +141,14 @@ pub fn entry(relative: Str, content: Bytes) -> StaticEntry []
 //     println(e.etag)
 // ```
 pub fn entry_with_etag(relative: Str, size: Int, etag: Str, is_weak: Bool) -> StaticEntry []
-    todo("static-nv.staticmeta.entry_with_etag")
+    let kind = mimeext.type_for_name(relative)
+    StaticEntry {
+        relative: relative,
+        size: size,
+        etag: etag,
+        etag_weak: is_weak,
+        content_type: kind,
+        modified_at: None }
 
 // The same entry with a modification time.
 //
@@ -142,7 +167,13 @@ pub fn entry_with_etag(relative: Str, size: Int, etag: Str, is_weak: Bool) -> St
 //     println("${staticmeta.has_modified(staticmeta.with_modified(e, at))}")
 // ```
 pub fn with_modified(e: StaticEntry, at: civil.CivilDateTime) -> StaticEntry []
-    todo("static-nv.staticmeta.with_modified")
+    StaticEntry {
+        relative: e.relative,
+        size: e.size,
+        etag: e.etag,
+        etag_weak: e.etag_weak,
+        content_type: e.content_type,
+        modified_at: Some(at) }
 
 // Whether an entry knows when its file changed.
 //
@@ -154,7 +185,10 @@ pub fn with_modified(e: StaticEntry, at: civil.CivilDateTime) -> StaticEntry []
 //     println("${staticmeta.has_modified(staticmeta.entry("a", bytes.from_byte_list([1])))}")
 // ```
 pub fn has_modified(e: StaticEntry) -> Bool []
-    todo("static-nv.staticmeta.has_modified")
+    let known = e.modified_at
+    match known
+        Some(_) => true
+        None    => false
 
 // The same entry with a media type the caller chose.
 //
@@ -171,9 +205,29 @@ pub fn has_modified(e: StaticEntry) -> Bool []
 //     println(staticmeta.with_type(e, "application/octet-stream").content_type)
 // ```
 pub fn with_type(e: StaticEntry, content_type: Str) -> StaticEntry []
-    todo("static-nv.staticmeta.with_type")
+    StaticEntry {
+        relative: e.relative,
+        size: e.size,
+        etag: e.etag,
+        etag_weak: e.etag_weak,
+        content_type: content_type,
+        modified_at: e.modified_at }
 
 // ── Entity tags ──────────────────────────────────────────────────────
+
+// Whether a tag carries § 8.8.3's weakness marker.
+//
+// The marker is syntax and not part of the tag, which is why the
+// comparisons below treat `W/"a"` and `"a"` differently.
+fn is_weak_tag(tag: Str) -> Bool
+    str.starts_with(tag, "W/")
+
+// A tag with its weakness marker removed: the opaque tag the weak
+// comparison compares and the strong one compares bytes of.
+fn opaque_tag(tag: Str) -> Str
+    if str.starts_with(tag, "W/")
+        return str.slice(tag, 2, str.len(tag))
+    tag
 
 // A bare token as a quoted entity tag: `abc` becomes `"abc"`.
 //
@@ -188,7 +242,8 @@ pub fn with_type(e: StaticEntry, content_type: Str) -> StaticEntry []
 //     println(staticmeta.quote_etag("b1946ac9"))
 // ```
 pub fn quote_etag(token: Str) -> Str []
-    todo("static-nv.staticmeta.quote_etag")
+    let quoted = "\"" + token + "\""
+    quoted
 
 // The same, marked weak: `W/"abc"`.
 //
@@ -199,7 +254,8 @@ pub fn quote_etag(token: Str) -> Str []
 //     println(staticmeta.quote_etag_weak("b1946ac9"))
 // ```
 pub fn quote_etag_weak(token: Str) -> Str []
-    todo("static-nv.staticmeta.quote_etag_weak")
+    let quoted = "W/" + quote_etag(token)
+    quoted
 
 // Whether two entity tags match under RFC 9110 § 8.8.3.1's STRONG
 // comparison: byte-identical, and neither weak.
@@ -216,7 +272,9 @@ pub fn quote_etag_weak(token: Str) -> Str []
 //     println("${staticmeta.etag_strong_eq("\"a\"", "\"a\"")}")
 // ```
 pub fn etag_strong_eq(a: Str, b: Str) -> Bool []
-    todo("static-nv.staticmeta.etag_strong_eq")
+    if is_weak_tag(a) or is_weak_tag(b)
+        return false
+    a == b
 
 // Whether two entity tags match under the WEAK comparison: the same
 // opaque tag, weakness ignored.
@@ -230,7 +288,7 @@ pub fn etag_strong_eq(a: Str, b: Str) -> Bool []
 //     println("${staticmeta.etag_weak_eq("W/\"a\"", "\"a\"")}")
 // ```
 pub fn etag_weak_eq(a: Str, b: Str) -> Bool []
-    todo("static-nv.staticmeta.etag_weak_eq")
+    opaque_tag(a) == opaque_tag(b)
 
 // The tags an `If-None-Match` or `If-Match` header lists.
 //
@@ -246,9 +304,80 @@ pub fn etag_weak_eq(a: Str, b: Str) -> Bool []
 //     println("${list.len(staticmeta.parse_etag_list("\"a\", W/\"b\""))}")
 // ```
 pub fn parse_etag_list(header: Str) -> [Str] []
-    todo("static-nv.staticmeta.parse_etag_list")
+    let trimmed = str.trim(header)
+    if trimmed == ""
+        return []
+    if trimmed == "*"
+        return ["*"]
+    var out: [Str] = []
+    for piece in str.split(trimmed, ",")
+        let tag = str.trim(piece)
+        if tag != ""
+            out = list.push(out, tag)
+    out
 
 // ── HTTP dates ───────────────────────────────────────────────────────
+
+// A two-digit zero-padded number, which every field of an IMF-fixdate
+// but the year is.
+fn two_digits(n: Int) -> Str
+    str.pad_left(str.from_int(n), 2, "0")
+
+// § 5.6.7's three-letter day name, from the weekday arithmetic rather
+// than from a table of its own.
+fn weekday_abbrev(w: civil.Weekday) -> Str
+    let names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    list.get(names, civil.weekday_number(w) - 1, "Mon")
+
+// § 5.6.7's three-letter month name for a month number.
+fn month_abbrev(m: Int) -> Str
+    let names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    list.get(names, m - 1, "Jan")
+
+// The text after the first whitespace-separated word, which is how
+// asctime writes a day name: its format has no comma in it at all.
+fn after_first_word(text: Str) -> Str
+    let space = str.index(text, " ")
+    match space
+        None    => ""
+        Some(i) => str.trim(str.slice(text, i + 1, str.len(text)))
+
+// The text after a leading day name and its comma.
+//
+// § 5.6.7's day name is REDUNDANT with the date it precedes, and a
+// client that spells the wrong one is still sending a date a server
+// should read.  The format strings below therefore start after it
+// rather than handing it to a parser that would check it.
+fn after_day_name(text: Str) -> Str
+    let comma = str.index(text, ",")
+    match comma
+        None    => after_first_word(text)
+        Some(i) => str.trim(str.slice(text, i + 1, str.len(text)))
+
+// One date read in one format, or `None` where the text does not have
+// that shape.  The parser is calendar-nv's strftime-shaped one and the
+// format strings are § 5.6.7's own three.
+fn date_in(text: Str, fmt: Str) -> ?civil.CivilDateTime
+    match strfmt.parse(text, fmt)
+        Ok(at) => Some(at)
+        Err(_) => None
+
+// The obsolete half of § 5.6.7: RFC 850's dashed form, whose year is
+// two digits, then asctime, whose day is space-padded.
+fn rfc_850_or_asctime(text: Str) -> ?civil.CivilDateTime
+    match date_in(text, "%d-%b-%y %H:%M:%S GMT")
+        Some(at) => Some(at)
+        None     => date_in(text, "%b %e %H:%M:%S %Y")
+
+// § 5.6.7's three formats tried in turn: IMF-fixdate, the obsolete RFC
+// 850 form, then asctime.  Anything else answers `None`, which is a
+// caller serving the whole file with a 200.
+fn date_in_any_format(text: Str) -> ?civil.CivilDateTime
+    let rest = after_day_name(text)
+    match date_in(rest, "%d %b %Y %H:%M:%S GMT")
+        Some(at) => Some(at)
+        None     => rfc_850_or_asctime(rest)
 
 // A civil date-time as RFC 9110 § 5.6.7's IMF-fixdate:
 // `Sun, 06 Nov 1994 08:49:37 GMT`.
@@ -266,7 +395,16 @@ pub fn parse_etag_list(header: Str) -> [Str] []
 //     println(staticmeta.format_http_date(at))
 // ```
 pub fn format_http_date(at: civil.CivilDateTime) -> Str []
-    todo("static-nv.staticmeta.format_http_date")
+    let d = at.date
+    let t = at.time
+    let day = weekday_abbrev(civil.weekday(d))
+    let dd = two_digits(d.day)
+    let mon = month_abbrev(d.month)
+    let year = str.pad_left(str.from_int(d.year), 4, "0")
+    let hh = two_digits(t.hour)
+    let mm = two_digits(t.minute)
+    let ss = two_digits(t.second)
+    "${day}, ${dd} ${mon} ${year} ${hh}:${mm}:${ss} GMT"
 
 // An HTTP date in any of the THREE formats § 5.6.7 requires a
 // recipient to accept.
@@ -286,7 +424,7 @@ pub fn format_http_date(at: civil.CivilDateTime) -> Str []
 //         None    => println("not a date this package reads")
 // ```
 pub fn parse_http_date(text: Str) -> ?civil.CivilDateTime []
-    todo("static-nv.staticmeta.parse_http_date")
+    date_in_any_format(str.trim(text))
 
 // The three date formats this package accepts, as strings a person can
 // read.
@@ -302,7 +440,7 @@ pub fn parse_http_date(text: Str) -> ?civil.CivilDateTime []
 //     println("${list.len(staticmeta.http_date_formats())}")
 // ```
 pub fn http_date_formats() -> [Str] []
-    todo("static-nv.staticmeta.http_date_formats")
+    ["IMF-fixdate", "RFC 850", "asctime"]
 
 // ── Conditional requests ─────────────────────────────────────────────
 
@@ -332,7 +470,12 @@ pub struct StaticConditions
 //     println("${staticmeta.evaluate(staticmeta.no_conditions(), an_entry(), false)}")
 // ```
 pub fn no_conditions() -> StaticConditions []
-    todo("static-nv.staticmeta.no_conditions")
+    StaticConditions {
+        if_match: "",
+        if_none_match: "",
+        if_modified_since: "",
+        if_unmodified_since: "",
+        if_range: "" }
 
 // Conditions read from a request's headers, as a lookup the caller
 // supplies.
@@ -357,7 +500,64 @@ pub fn no_conditions() -> StaticConditions []
 //     println("${staticmeta.evaluate(staticmeta.conditions_of(no_headers), an_entry(), false)}")
 // ```
 pub fn conditions_of(header: fn(Str) -> Str []) -> StaticConditions []
-    todo("static-nv.staticmeta.conditions_of")
+    let m = header("If-Match")
+    let nm = header("If-None-Match")
+    let ims = header("If-Modified-Since")
+    let ius = header("If-Unmodified-Since")
+    let ir = header("If-Range")
+    StaticConditions {
+        if_match: m,
+        if_none_match: nm,
+        if_modified_since: ims,
+        if_unmodified_since: ius,
+        if_range: ir }
+
+// Whether an `If-Match` header holds: `*` where the representation
+// exists, or a listed tag equal to the entry's under the STRONG
+// comparison.  A weak entry tag can never satisfy it.
+fn if_match_holds(header: Str, e: StaticEntry) -> Bool
+    let tags = parse_etag_list(header)
+    for tag in tags
+        if tag == "*"
+            return true
+        if etag_strong_eq(tag, e.etag)
+            return true
+    false
+
+// Whether an `If-Unmodified-Since` header holds.  It FAILS where the
+// entry changed after the date — which is the direction that reads
+// backwards — and an entry with no modification time cannot fail it.
+fn if_unmodified_holds(header: Str, e: StaticEntry) -> Bool
+    let known = e.modified_at
+    let Some(modified) = known else
+        return true
+    let Some(stamp) = parse_http_date(header) else
+        return true
+    civil.compare_datetime(modified, stamp) <= 0
+
+// Whether an `If-None-Match` header matches this entry: `*` matches
+// anything that exists, and a listed tag matches under the WEAK
+// comparison.
+fn if_none_match_matches(header: Str, e: StaticEntry) -> Bool
+    let tags = parse_etag_list(header)
+    for tag in tags
+        if tag == "*"
+            return true
+        if etag_weak_eq(tag, e.etag)
+            return true
+    false
+
+// Whether an `If-Modified-Since` header says the entry has NOT changed
+// — the header's own wording, which is the negation of what it asks.
+// An entry with no modification time cannot answer it, and neither can
+// a date this package cannot read.
+fn if_modified_matches(header: Str, e: StaticEntry) -> Bool
+    let known = e.modified_at
+    let Some(modified) = known else
+        return false
+    let Some(stamp) = parse_http_date(header) else
+        return false
+    civil.compare_datetime(modified, stamp) <= 0
 
 // What the conditions say to answer, as a status code.
 //
@@ -390,7 +590,26 @@ pub fn conditions_of(header: fn(Str) -> Str []) -> StaticConditions []
 //     println("${staticmeta.evaluate(staticmeta.no_conditions(), an_entry(), true)}")
 // ```
 pub fn evaluate(c: StaticConditions, e: StaticEntry, is_read: Bool) -> Int []
-    todo("static-nv.staticmeta.evaluate")
+    let has_match = str.trim(c.if_match) != ""
+    let has_unmodified = str.trim(c.if_unmodified_since) != ""
+    let has_none = str.trim(c.if_none_match) != ""
+    let has_modified = str.trim(c.if_modified_since) != ""
+    if has_match
+        if not if_match_holds(c.if_match, e)
+            return 412
+    elif has_unmodified
+        if not if_unmodified_holds(c.if_unmodified_since, e)
+            return 412
+    if has_none
+        if if_none_match_matches(c.if_none_match, e)
+            if is_read
+                return 304
+            return 412
+        return 200
+    if has_modified and is_read
+        if if_modified_matches(c.if_modified_since, e)
+            return 304
+    200
 
 // Whether a request's `If-Range` permits a range to be answered.
 //
@@ -417,7 +636,17 @@ pub fn evaluate(c: StaticConditions, e: StaticEntry, is_read: Bool) -> Int []
 //     println("${staticmeta.range_allowed(staticmeta.no_conditions(), an_entry())}")
 // ```
 pub fn range_allowed(c: StaticConditions, e: StaticEntry) -> Bool []
-    todo("static-nv.staticmeta.range_allowed")
+    let header = str.trim(c.if_range)
+    if header == ""
+        return true
+    if str.starts_with(header, "\"") or str.starts_with(header, "W/")
+        return etag_strong_eq(header, e.etag)
+    let Some(stamp) = parse_http_date(header) else
+        return false
+    let known = e.modified_at
+    let Some(modified) = known else
+        return false
+    civil.compare_datetime(modified, stamp) == 0
 
 // ── Cache-Control ────────────────────────────────────────────────────
 
@@ -440,7 +669,11 @@ pub fn range_allowed(c: StaticConditions, e: StaticEntry) -> Bool []
 //     println(staticmeta.cache_header(staticmeta.fingerprinted()))
 // ```
 pub fn fingerprinted() -> StaticCache []
-    todo("static-nv.staticmeta.fingerprinted")
+    StaticCache {
+        max_age: 31536000,
+        shareable: true,
+        immutable: true,
+        must_revalidate: false }
 
 // The preset for a file whose name is stable and whose content
 // changes: an HTML page, a stylesheet without a hash.
@@ -457,7 +690,11 @@ pub fn fingerprinted() -> StaticCache []
 //     println(staticmeta.cache_header(staticmeta.revalidated()))
 // ```
 pub fn revalidated() -> StaticCache []
-    todo("static-nv.staticmeta.revalidated")
+    StaticCache {
+        max_age: 0,
+        shareable: true,
+        immutable: false,
+        must_revalidate: false }
 
 // The preset for something a shared cache must not keep: a page
 // rendered for one signed-in person.
@@ -473,7 +710,11 @@ pub fn revalidated() -> StaticCache []
 //     println(staticmeta.cache_header(staticmeta.uncached()))
 // ```
 pub fn uncached() -> StaticCache []
-    todo("static-nv.staticmeta.uncached")
+    StaticCache {
+        max_age: 0,
+        shareable: false,
+        immutable: false,
+        must_revalidate: false }
 
 // A preset with a caller's own age.
 //
@@ -484,7 +725,11 @@ pub fn uncached() -> StaticCache []
 //     println(staticmeta.cache_header(staticmeta.cached_for(3600)))
 // ```
 pub fn cached_for(max_age_secs: Int) -> StaticCache []
-    todo("static-nv.staticmeta.cached_for")
+    StaticCache {
+        max_age: max_age_secs,
+        shareable: true,
+        immutable: false,
+        must_revalidate: false }
 
 // A `Cache-Control` header value.
 //
@@ -495,10 +740,67 @@ pub fn cached_for(max_age_secs: Int) -> StaticCache []
 //     println(staticmeta.cache_header(staticmeta.cached_for(60)))
 // ```
 pub fn cache_header(c: StaticCache) -> Str []
-    todo("static-nv.staticmeta.cache_header")
+    var out: [Str] = []
+    if c.shareable
+        out = list.push(out, "public")
+        if c.max_age == 0
+            out = list.push(out, "no-cache")
+        else
+            out = list.push(out, "max-age=" + str.from_int(c.max_age))
+    else
+        out = list.push(out, "private")
+        out = list.push(out, "no-store")
+    if c.immutable
+        out = list.push(out, "immutable")
+    if c.must_revalidate
+        out = list.push(out, "must-revalidate")
+    str.join(out, ", ")
+
+// The last component of a relative path: the file's own name, with no
+// directory left on it.
+fn last_component(relative: Str) -> Str
+    var start = 0
+    var i = 0
+    while i < str.len(relative)
+        if str.byte_at_or(relative, i, 0) == '/'
+            start = i + 1
+        i = i + 1
+    str.slice(relative, start, str.len(relative))
+
+// The pieces of a file name cut at dots and dashes, which are the two
+// separators a build puts between a name and a content hash.
+fn fingerprint_parts(relative: Str) -> [Str]
+    let name = last_component(relative)
+    list.flat_map(str.split(name, "."), piece => str.split(piece, "-"))
+
+// Whether a byte is one of the sixteen hexadecimal digits, in either
+// case.
+fn is_hex_byte(b: Int) -> Bool
+    if b >= '0' and b <= '9'
+        return true
+    if b >= 'a' and b <= 'f'
+        return true
+    if b >= 'A' and b <= 'F'
+        return true
+    false
+
+// Whether a run is long enough to be a content hash and made of
+// hexadecimal digits only.  Eight is the floor, and the reason is the
+// promise on the other side of it: below it ordinary words are hex —
+// `decade.gif` and `facade.png` are six and six — and a false positive
+// here is a year of `immutable` on a file that changes.
+fn is_hex_run(run: Str) -> Bool
+    if str.len(run) < 8
+        return false
+    var i = 0
+    while i < str.len(run)
+        if not is_hex_byte(str.byte_at_or(run, i, 0))
+            return false
+        i = i + 1
+    true
 
 // Whether a relative path looks like it carries a content
-// fingerprint — `site.a1b2c3d4.css`, `app-9f8e7d.js`.
+// fingerprint — `site.a1b2c3d4.css`, `app-9f8e7d6c.js`.
 //
 // A heuristic, and it says so: a deployment choosing `fingerprinted()`
 // on the strength of it is promising `immutable` about a file this
@@ -513,4 +815,8 @@ pub fn cache_header(c: StaticCache) -> Str []
 //     println("${staticmeta.looks_fingerprinted("site.a1b2c3d4.css")}")
 // ```
 pub fn looks_fingerprinted(relative: Str) -> Bool []
-    todo("static-nv.staticmeta.looks_fingerprinted")
+    let parts = fingerprint_parts(relative)
+    for part in parts
+        if is_hex_run(part)
+            return true
+    false
