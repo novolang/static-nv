@@ -76,6 +76,12 @@ lines, the three left excused in the source.
   (open, 0.20.2).  `on_disk` and `clock_value` are the longer names
   that avoid it, and they are the clearer names either way.
 
+This release requires novo 0.23.0 or later.
+
+## 0.0.3 — 2026-10-28
+
+The dependency requirement is raised: `calendar-nv` from ^0.0.2 to ^0.2.1.  The newest version of each builds with no migration warning under the 0.22.0 compiler, and the older one drew E2050, E2052 or E2055 warnings into this package's build.  No signature and no behaviour changed.
+
 ## 0.0.2 — 2026-09-18
 
 `StaticRefusal` implements `Error`; no signature changed.  README rewritten to the package README style guide (docs/writing-a-readme.md).
